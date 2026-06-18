@@ -1,0 +1,15 @@
+# Model weights
+models/
+llms/
+
+# Cache
+.model_cache/
+__pycache__/
+*.pyc
+
+# Download script (not needed in repo)
+download_llama.py
+
+# Output files
+data/redacted.txt
+data/audit.json
