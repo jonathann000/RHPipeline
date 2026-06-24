@@ -28,6 +28,22 @@ from pipeline import PIIPipeline
 # LLM backend options
 # -----------------------------------------------------------------------
 LLM_BACKENDS = {
+    "llama": {
+        "llm_backend":    "llama",
+        "llm_model_path": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    },
+    "mistral": {
+        "llm_backend":    "mistral",
+        "llm_model_path": "mistralai/Mistral-7B-Instruct-v0.3",
+    },
+    "qwen": {
+        "llm_backend":    "qwen",
+        "llm_model_path": "Qwen/Qwen3-8B",
+    },
+    "gemma": {
+        "llm_backend":    "gemma",
+        "llm_model_path": "google/gemma-2-9b-it",
+    },
     "gpt-sw3": {
         "llm_backend":    "gpt-sw3",
         "llm_model_path": "AI-Sweden-Models/gpt-sw3-20b-instruct",
@@ -35,10 +51,6 @@ LLM_BACKENDS = {
     "eurollm": {
         "llm_backend":    "eurollm",
         "llm_model_path": "utter-project/EuroLLM-9B-Instruct",
-    },
-    "llama": {
-        "llm_backend":    "llama",
-        "llm_model_path": "meta-llama/Meta-Llama-3.1-8B-Instruct",
     },
 }
 
@@ -51,9 +63,9 @@ BASE_CONFIG = {
 
 def main():
     parser = argparse.ArgumentParser(description="PHI De-identification Pipeline")
-    parser.add_argument("--input",  required=True,  help="Path to input text file")
-    parser.add_argument("--output", required=True,  help="Path to write redacted text")
-    parser.add_argument("--audit",  required=True,  help="Path to write audit log (JSON)")
+    parser.add_argument("--input",  default="data/notes.txt",  help="Path to input text file")
+    parser.add_argument("--output", default="data/redacted.txt",  help="Path to write redacted text")
+    parser.add_argument("--audit",  default="data/audit.json",  help="Path to write audit log (JSON)")
     parser.add_argument(
         "--mode",
         default="full",
@@ -66,9 +78,9 @@ def main():
     )
     parser.add_argument(
         "--llm",
-        default="gpt-sw3",
+        default="llama",
         choices=list(LLM_BACKENDS.keys()),
-        help="LLM backend to use (default: gpt-sw3)"
+        help="LLM backend to use (default: llama)"
     )
     args = parser.parse_args()
 

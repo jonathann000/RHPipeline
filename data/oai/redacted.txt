@@ -1,0 +1,31 @@
+Journalanteckning [DATUM]
+
+Patient:[PERSON][PERSON], personnummer [ID-NUMMER]
+Telefon: [TELEFON]
+E-post: [E-POST]
+Adress:[ADRESS] [ADRESS], [ADRESS][ADRESS]
+
+Bakgrund:
+Erik är en [PERSON]-årig ensamstående förälder, bosatt i en liten by utanför[ADRESS]. Han har arbetat som hantverkare i [ADRESS] år. Patienten remitterades från[ADRESS]vs sjukhus till S[ADRESS] för vidare utredning.
+
+Aktuellt:
+Patienten söker för progredierande muskelsvaghet och koordinationssvårigheter sedan augusti 2023. Genetisk testning bekräftade diagnosen sällsynt neurologisk sjukdom. Patienten är den yngsta kända patienten med denna diagnos i[ADRESS].
+
+Patienten uppger att hans mor,[PERSON][PERSON] (personnummer [ID-NUMMER]), också hade neurologiska symptom innan hon avled [DATUM]. Kontaktperson: systern[PERSON][PERSON], tel [TELEFON], e-post [[E-POST]](mailto:[E-POST]).
+
+Socialt:
+Patienten är aktiv medlem i[ADRESS]älvs jaktklubb och sjunger i den lokala kyrkokören. Han beskriver sig som djupt troende religiös tillhörighet. Patienten bor i en anpassad lägenhet via kommunens socialtjänst. Har sjukersättning sedan [DATUM].
+
+Bedömning:
+Bilden är förenlig med Huntingtons sjukdom, verifierad genom genetisk testning. Patienten uppvisar progredierande motoriska symtom med muskelsvaghet och koordinationssvårigheter. Tillståndet bedöms vara i tidigt till medelsvårt stadium. Fortsatt neurologisk uppföljning planeras.
+
+Plan:
+
+* Uppföljning var 3:e månad på neurologmottagningen
+* Kontakt med kurator för stöd kring barnens situation
+* Ansökan om utökad hemtjänst via[ADRESS]
+*[ADRESS] [DATUM]
+
+Ansvarig läkare:[PERSON].[PERSON][PERSON], överläkare neurologi
+Dikterat: [DATUM] kl 14:32
+Signerat: [DATUM]

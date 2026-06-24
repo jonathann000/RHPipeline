@@ -153,16 +153,22 @@ class HuggingFaceLLMBackend(LLMBackend):
     # Model-specific prompt templates
     CHAT_TEMPLATES = {
         "gpt-sw3": {
-            # GPT-SW3 uses a simple User/Assistant format
             "format": "User: {system}\n\n{user}\nAssistant:",
         },
         "eurollm": {
-            # EuroLLM follows standard chat ML format
             "format": "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
         },
         "llama": {
-            # Llama 3.1 instruct format
             "format": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n",
+        },
+        "mistral": {
+            "format": "[INST] {system}\n\n{user} [/INST]",
+        },
+        "qwen": {
+            "format": "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
+        },
+        "gemma": {
+            "format": "<start_of_turn>user\n{system}\n\n{user}<end_of_turn>\n<start_of_turn>model\n",
         },
     }
 
@@ -309,7 +315,7 @@ def load_llm(backend_name: str, model_path: str) -> LLMBackend:
     if backend_name == "mock":
         return MockLLMBackend()
 
-    supported = {"gpt-sw3", "eurollm", "llama"}
+    supported = {"gpt-sw3", "eurollm", "llama", "mistral", "qwen", "gemma"}
     if backend_name not in supported:
         raise ValueError(f"Unknown backend '{backend_name}'. Choose from: {supported}")
 
