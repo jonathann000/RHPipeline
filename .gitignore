@@ -11,5 +11,18 @@ __pycache__/
 download_llama.py
 
 # Output files
-data/redacted.txt
-data/audit.json
+data/
+
+# macOS 
+.DS_Store
+
+# env
+.venv/
+
+# IDE 
+.vscode/
+.idea/
+
+# Logs
+*.log 
+

@@ -11,7 +11,19 @@ All backends use the same interface — swap by changing config only.
 detect_direct=False (default): LLM only looks for quasi-identifiers
                                (used in "full" and "no_bert" modes)
 detect_direct=True:            LLM handles all PII including direct identifiers
-                               (used in "llm_only" mode)
+                               (used in "llm_only" mode, or "full"/"no_bert" with
+                               llm_backstop enabled — see below)
+
+backstop_existing=False (default): full detection re-enumerates everything
+                               from scratch, ignoring `existing` (today's
+                               llm_only/no_bert behavior).
+backstop_existing=True:       full detection is told the specific entity
+                               texts already found (by rules/BERT) and asked
+                               to skip those, catching quasi-identifiers plus
+                               any direct identifiers those stages missed —
+                               without wasting output budget re-deriving
+                               spans already covered. Only meaningful when
+                               detect_direct=True.
 """
 
 import json
@@ -99,26 +111,66 @@ Entiteter:
 """
 
 def _parse_llm_json(raw: str) -> list[dict]:
-    """Robustly extract a JSON list from LLM output."""
-    # Strip markdown fences if present
+    """
+    Robustly extract entities from LLM output.
+    Long documents can push generation past max_new_tokens, cutting the JSON
+    array off mid-entity — salvage whichever top-level objects are individually
+    complete rather than discarding the whole batch.
+    """
+    # Strip a reasoning block (e.g. Qwen3's <think>...</think>) and markdown
+    # fences before looking for the entity array, so stray brackets in the
+    # model's reasoning text don't get mistaken for the JSON payload.
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
     raw = re.sub(r"```json|```", "", raw).strip()
-    # Find first [ ... ] block
+
     match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not match:
-        return []
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass  # malformed (likely truncated) — fall through to salvage below
+
+    objects = [
+        json.loads(m.group())
+        for m in re.finditer(r"\{[^{}]*\}", raw)
+        if _is_valid_json(m.group())
+    ]
+    if objects:
+        logger.warning(f"LLM JSON output was truncated/malformed — salvaged {len(objects)} complete entities")
+    else:
+        logger.warning(f"Failed to parse LLM JSON output — raw length: {len(raw)} chars")
+    return objects
+
+
+def _is_valid_json(s: str) -> bool:
     try:
-        return json.loads(match.group())
+        json.loads(s)
+        return True
     except json.JSONDecodeError:
-        logger.warning("Failed to parse LLM JSON output")
-        return []
+        return False
 
 
-def _resolve_offsets(text: str, entity_text: str) -> tuple[int, int] | None:
-    """Find char offsets of entity_text in text. Returns None if not found."""
-    idx = text.find(entity_text)
-    if idx == -1:
+def _resolve_offsets(
+    text: str, entity_text: str, claimed: set[tuple[int, int]]
+) -> tuple[int, int] | None:
+    """
+    Find char offsets of entity_text in text, skipping spans already claimed
+    by an earlier entity in this batch. The LLM can legitimately report the
+    same phrase for two distinct occurrences (e.g. a diagnosis mentioned
+    twice) — each should resolve to its own occurrence, not collapse onto
+    the first match found.
+    """
+    if not entity_text:
         return None
-    return idx, idx + len(entity_text)
+    search_from = 0
+    while True:
+        idx = text.find(entity_text, search_from)
+        if idx == -1:
+            return None
+        span = (idx, idx + len(entity_text))
+        if span not in claimed:
+            return span
+        search_from = idx + 1
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +183,20 @@ class LLMBackend(ABC):
         self,
         text: str,
         existing: list[Entity],
-        detect_direct: bool = False
+        detect_direct: bool = False,
+        backstop_existing: bool = False,
+        enable_thinking: bool = False,
     ) -> list[Entity]:
         """
-        detect_direct=False: quasi-identifiers only (used alongside BERT/rules)
-        detect_direct=True:  all PII including direct identifiers (llm_only mode)
+        detect_direct=False:     quasi-identifiers only (used alongside BERT/rules)
+        detect_direct=True:      all PII including direct identifiers (llm_only mode)
+        backstop_existing=True:  (only with detect_direct=True) skip spans already
+                                  found by rules/BERT instead of re-deriving them,
+                                  while still catching quasi-identifiers plus any
+                                  direct identifiers those stages missed
+        enable_thinking=True:    ask the model to reason in a <think> block before
+                                  answering (only meaningful on backends that support
+                                  it, e.g. Qwen3 — ignored by everything else)
         """
         pass
 
@@ -150,31 +211,10 @@ class HuggingFaceLLMBackend(LLMBackend):
     Works with GPT-SW3, EuroLLM, Llama, and most instruct-tuned models.
     """
 
-    # Model-specific prompt templates
-    CHAT_TEMPLATES = {
-        "gpt-sw3": {
-            "format": "User: {system}\n\n{user}\nAssistant:",
-        },
-        "eurollm": {
-            "format": "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
-        },
-        "llama": {
-            "format": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n",
-        },
-        "mistral": {
-            "format": "[INST] {system}\n\n{user} [/INST]",
-        },
-        "qwen": {
-            "format": "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n",
-        },
-        "gemma": {
-            "format": "<start_of_turn>user\n{system}\n\n{user}<end_of_turn>\n<start_of_turn>model\n",
-        },
-    }
-
     def __init__(self, backend_name: str, model_path: str):
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline as hf_pipeline
+        from device import resolve_device_map
 
         self.backend_name = backend_name
         logger.info(f"Loading LLM: {model_path}")
@@ -183,7 +223,7 @@ class HuggingFaceLLMBackend(LLMBackend):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=resolve_device_map(),
         )
         self.model.eval()
 
@@ -193,24 +233,41 @@ class HuggingFaceLLMBackend(LLMBackend):
             tokenizer=self.tokenizer,
         )
 
-    def _build_prompt(self, text: str, existing: list[Entity], detect_direct: bool) -> str:
-        template = self.CHAT_TEMPLATES.get(
-            self.backend_name,
-            self.CHAT_TEMPLATES["llama"]
-        )
-
-        if detect_direct:
+    def _build_prompt(
+        self,
+        text: str,
+        existing: list[Entity],
+        detect_direct: bool,
+        backstop_existing: bool = False,
+        enable_thinking: bool = False,
+    ) -> str:
+        if detect_direct and backstop_existing:
+            # Full detection, but told exactly what's already been found —
+            # skip re-deriving those spans, catch quasi-identifiers plus any
+            # direct identifiers rules/BERT missed.
+            already_found = ", ".join(dict.fromkeys(e.text for e in existing)) or "inga ännu"
+            system = FULL_DETECTION_SYSTEM
+            user_msg = (
+                f"{FEW_SHOT_FULL}\n"
+                f"Redan identifierade (hoppa över dessa): {already_found}\n"
+                f"Identifiera ALLA ÖVRIGA direkta identifierare och quasi-identifierare "
+                f"som inte redan är med i listan ovan.\n\n"
+                f"Text: \"{text}\"\n"
+                f"Entiteter:"
+            )
+        elif detect_direct:
             # llm_only mode — detect everything from scratch
+            system = FULL_DETECTION_SYSTEM
             user_msg = (
                 f"{FEW_SHOT_FULL}\n"
                 f"Identifiera ALLA direkta identifierare och quasi-identifierare.\n\n"
                 f"Text: \"{text}\"\n"
                 f"Entiteter:"
             )
-            return template["format"].format(system=FULL_DETECTION_SYSTEM, user=user_msg)
         else:
             # Hybrid mode — only quasi-identifiers, rules/BERT already ran
             already_found = ", ".join(set(e.label for e in existing)) or "inga ännu"
+            system = QUASI_ID_SYSTEM
             user_msg = (
                 f"{FEW_SHOT}\n"
                 f"Redan identifierade entiteter: {already_found}\n"
@@ -218,19 +275,67 @@ class HuggingFaceLLMBackend(LLMBackend):
                 f"Text: \"{text}\"\n"
                 f"Quasi-identifierare:"
             )
-            return template["format"].format(system=QUASI_ID_SYSTEM, user=user_msg)
+
+        return self._apply_chat_template(system, user_msg, enable_thinking)
+
+    def _apply_chat_template(
+        self, system: str, user_msg: str, enable_thinking: bool = False
+    ) -> str:
+        """
+        Use the tokenizer's own chat template rather than a hand-maintained
+        per-model format string — every instruct-tuned checkpoint ships one,
+        so a newly added backend works with zero changes here. Some
+        templates (e.g. Gemma) reject a separate system role — fall back to
+        folding it into the user turn, same as that model expects natively.
+
+        enable_thinking is a Qwen3-specific chat-template kwarg; templates
+        that don't reference it (everything except Qwen3) simply ignore it.
+        """
+        try:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ]
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except Exception:
+            messages = [{"role": "user", "content": f"{system}\n\n{user_msg}"}]
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
 
     def detect(
         self,
         text: str,
         existing: list[Entity],
-        detect_direct: bool = False
+        detect_direct: bool = False,
+        backstop_existing: bool = False,
+        enable_thinking: bool = False,
     ) -> list[Entity]:
-        prompt = self._build_prompt(text, existing, detect_direct)
+        prompt = self._build_prompt(text, existing, detect_direct, backstop_existing, enable_thinking)
+
+        if enable_thinking:
+            # A <think> block consumes generation budget before the actual
+            # answer — reasoning models can use 5-20x more tokens per
+            # response than non-reasoning ones, so this needs real headroom.
+            max_new_tokens = 4096
+        elif detect_direct:
+            # Full detection enumerates direct + quasi identifiers (~2x the
+            # entries of quasi-only), so it needs more headroom too.
+            max_new_tokens = 2048
+        else:
+            max_new_tokens = 512
 
         output = self.pipe(
             prompt,
-            max_new_tokens=512,
+            max_new_tokens=max_new_tokens,
             temperature=0.1,     # low temp for consistent structured output
             do_sample=True,
             pad_token_id=self.tokenizer.eos_token_id,
@@ -240,11 +345,13 @@ class HuggingFaceLLMBackend(LLMBackend):
         raw_entities = _parse_llm_json(generated)
 
         entities = []
+        claimed_spans: set[tuple[int, int]] = set()
         for ent in raw_entities:
-            offsets = _resolve_offsets(text, ent.get("text", ""))
+            offsets = _resolve_offsets(text, ent.get("text", ""), claimed_spans)
             if offsets is None:
                 logger.debug(f"Skipping hallucinated span: {ent.get('text')}")
                 continue
+            claimed_spans.add(offsets)
 
             entities.append(Entity(
                 text=ent["text"],
@@ -271,7 +378,9 @@ class MockLLMBackend(LLMBackend):
         self,
         text: str,
         existing: list[Entity],
-        detect_direct: bool = False
+        detect_direct: bool = False,
+        backstop_existing: bool = False,
+        enable_thinking: bool = False,
     ) -> list[Entity]:
         entities = []
         # Simple keyword scan to simulate LLM detection
@@ -280,8 +389,9 @@ class MockLLMBackend(LLMBackend):
             "ensamstående": ("demographics", "medium", "familjesituation"),
             "Huntingtons": ("medical", "high", "sällsynt neurologisk sjukdom"),
         }
+        claimed_spans: set[tuple[int, int]] = set()
         for kw, (label, risk, generalize) in keywords.items():
-            offsets = _resolve_offsets(text, kw)
+            offsets = _resolve_offsets(text, kw, claimed_spans)
             if offsets:
                 entities.append(Entity(
                     text=kw,

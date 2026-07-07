@@ -14,10 +14,27 @@ Usage:
     # Swap LLM backend
     python run.py --input notes.txt --output redacted.txt --audit audit.json --llm eurollm
 
+    # LLM also backstops direct identifiers rules/BERT missed (any mode)
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --llm-backstop
+
+    # Qwen3 with native thinking mode enabled
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --llm qwen --llm-thinking
+
 Modes:
     full      Rules → BERT → LLM quasi-IDs        (default)
     no_bert   Rules → LLM (direct + quasi-IDs)
     llm_only  LLM handles everything from scratch
+
+--llm-backstop is independent of --mode: it tells the LLM which specific
+spans rules/BERT already found and asks it to catch anything else,
+including direct identifiers those stages missed, instead of only doing
+the job normally assigned to its mode. Off by default so both strategies
+can be compared against each other.
+
+--llm-thinking asks the model to reason in a <think> block before
+answering. Only meaningful on backends that support it (currently just
+Qwen3) — ignored by everything else. Uses significantly more output
+tokens per call, so it's off by default.
 """
 
 import argparse
@@ -82,10 +99,26 @@ def main():
         choices=list(LLM_BACKENDS.keys()),
         help="LLM backend to use (default: llama)"
     )
+    parser.add_argument(
+        "--llm-backstop",
+        action="store_true",
+        help="LLM also catches direct identifiers rules/BERT missed, independent of --mode (default: off)"
+    )
+    parser.add_argument(
+        "--llm-thinking",
+        action="store_true",
+        help="Ask the LLM to reason in a <think> block before answering (Qwen3 only, ignored elsewhere; default: off)"
+    )
     args = parser.parse_args()
 
-    config = {**BASE_CONFIG, **LLM_BACKENDS[args.llm], "mode": args.mode}
-    print(f"Mode: {args.mode} | LLM: {args.llm}")
+    config = {
+        **BASE_CONFIG,
+        **LLM_BACKENDS[args.llm],
+        "mode": args.mode,
+        "llm_backstop": args.llm_backstop,
+        "llm_thinking": args.llm_thinking,
+    }
+    print(f"Mode: {args.mode} | LLM: {args.llm} | Backstop: {args.llm_backstop} | Thinking: {args.llm_thinking}")
 
     pipe = PIIPipeline(config)
 
