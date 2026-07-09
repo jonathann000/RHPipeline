@@ -2,9 +2,10 @@
 Swappable LLM backend for PII detection.
 
 Supported backends (set via config["llm_backend"]):
-  - "gpt-sw3"    : AI Sweden GPT-SW3 (recommended for Swedish clinical text)
-  - "eurollm"    : EuroLLM-9B (strong Swedish benchmarks)
   - "llama"      : Llama 3.1 8B Instruct (multilingual baseline)
+  - "mistral"    : Mistral 7B Instruct
+  - "qwen"       : Qwen3 8B (native thinking mode support)
+  - "gemma"      : Gemma 2 9B Instruct
 
 All backends use the same interface — swap by changing config only.
 
@@ -14,16 +15,21 @@ detect_direct=True:            LLM handles all PII including direct identifiers
                                (used in "llm_only" mode, or "full"/"no_bert" with
                                llm_backstop enabled — see below)
 
-backstop_existing=False (default): full detection re-enumerates everything
-                               from scratch, ignoring `existing` (today's
+scan_text=None (default):     the model sees `text` itself (today's
                                llm_only/no_bert behavior).
-backstop_existing=True:       full detection is told the specific entity
-                               texts already found (by rules/BERT) and asked
-                               to skip those, catching quasi-identifiers plus
-                               any direct identifiers those stages missed —
-                               without wasting output budget re-deriving
-                               spans already covered. Only meaningful when
+scan_text=<partial redaction>: the model sees a partially-redacted view
+                               instead of the raw document (used by
+                               llm_backstop and the judge retry loop) —
+                               anything already redacted is invisible to the
+                               model, so it can only report what's still
+                               exposed, without needing a "skip already
+                               found" instruction. `text` is still used to
+                               resolve final offsets. Only meaningful when
                                detect_direct=True.
+
+load_llm() caches loaded backends by (backend_name, model_path) so the
+judge panel and the main detection LLM can share a checkpoint instead of
+loading it twice.
 """
 
 import json
@@ -110,6 +116,74 @@ Entiteter:
 ]
 """
 
+# Used for the judge retry pass — classifying specific already-flagged
+# excerpts, NOT scanning for new ones. Deliberately its own prompt rather
+# than reusing FULL_DETECTION_SYSTEM: that system prompt's whole framing
+# ("identify ALL...") and few-shot example (which demonstrates scanning an
+# entire document) pull the model back toward a full sweep even when the
+# user message says "just classify these" — the system prompt matters more
+# than the instruction layered on top of it.
+TARGETED_CLASSIFY_SYSTEM = """Du är ett system som klassificerar EXAKT angivna textutdrag ur en svensk journalanteckning.
+Du letar INTE efter ny information — en granskare har redan identifierat exakt vilka utdrag som är problematiska.
+
+Kategorier:
+Direkta identifierare (generalize ska alltid vara null):
+- private_person, private_email, private_phone, account_number, private_address, private_date, secret
+Quasi-identifierare (generalize: en riktig generalisering som INTE innehåller den ursprungliga texten):
+- demographics, medical, temporal, social
+
+Ditt enda jobb: klassificera VARJE angivet utdrag nedan. Lägg INTE till några
+andra fynd, även om du ser annan information i den bifogade texten — texten
+finns enbart som sammanhang för att avgöra rätt kategori och generalisering.
+
+Returnera ENBART giltig JSON — exakt en post per angivet utdrag, i samma ordning:
+[{"text": "utdraget exakt som angivet", "label": "...", "risk": "low/medium/high", "generalize": "... eller null"}]
+"""
+
+TARGETED_CLASSIFY_FEW_SHOT = """
+Exempel:
+Angivna utdrag:
+1. "Erik Svensson"
+2. "Lilla Edet"
+Text (sammanhang): "Patienten Erik Svensson bosatt i Lilla Edet."
+Entiteter:
+[
+  {"text": "Erik Svensson", "label": "private_person", "risk": "high", "generalize": null},
+  {"text": "Lilla Edet", "label": "private_address", "risk": "high", "generalize": "mindre ort i Västra Götaland"}
+]
+"""
+
+# Used by the judge panel — a different task from detection: audit a
+# document that's already been redacted, rather than enumerate entities.
+JUDGE_SYSTEM = """Du är en integritetsgranskare som kontrollerar avidentifierade svenska journalanteckningar.
+Dokumentet du får har redan genomgått avidentifiering — vissa uppgifter är ersatta med platshållare:
+[PERSON], [ADRESS], [TELEFON], [E-POST], [ID-NUMMER], [DATUM], [HEMLIG-UPPGIFT],
+[DEMOGRAFISK-UPPGIFT], [MEDICINSK-UPPGIFT], [TIDPUNKT], [SOCIAL-UPPGIFT], [REDAKTERAD].
+
+Dessa platshållare räknas som redan rena — flagga dem ALDRIG.
+
+Din enda uppgift: hitta text som INTE redan är maskerad men som ändå avslöjar vem patienten
+eller andra namngivna personer i texten är — t.ex. namn, adresser, telefonnummer, e-post,
+personnummer, eller annan direkt identifierande uppgift som blivit kvar av misstag.
+
+Returnera ENBART giltig JSON — en lista, inga förklaringar utanför JSON.
+Om dokumentet är rent: returnera en tom lista [].
+Om något avslöjande kvarstår, en post per fynd:
+[{"quote": "exakt textutdrag som fortfarande avslöjar identitet", "reason": "kort motivering"}]
+"""
+
+JUDGE_FEW_SHOT = """
+Exempel 1 (rent dokument):
+Text: "Patienten [PERSON], [DEMOGRAFISK-UPPGIFT], sökte för huvudvärk. Bosatt i [ADRESS]."
+Bedömning:
+[]
+
+Exempel 2 (kvarvarande läckage):
+Text: "Ansvarig läkare: Dr. Helena Björk, överläkare neurologi. Patienten [PERSON] har [DATUM]."
+Bedömning:
+[{"quote": "Dr. Helena Björk", "reason": "läkarens fullständiga namn är inte maskerat"}]
+"""
+
 def _parse_llm_json(raw: str) -> list[dict]:
     """
     Robustly extract entities from LLM output.
@@ -184,46 +258,69 @@ class LLMBackend(ABC):
         text: str,
         existing: list[Entity],
         detect_direct: bool = False,
-        backstop_existing: bool = False,
         enable_thinking: bool = False,
+        scan_text: str | None = None,
+        target_quotes: list[str] | None = None,
     ) -> list[Entity]:
         """
+        text:                    original document — always used to resolve entity offsets
         detect_direct=False:     quasi-identifiers only (used alongside BERT/rules)
-        detect_direct=True:      all PII including direct identifiers (llm_only mode)
-        backstop_existing=True:  (only with detect_direct=True) skip spans already
-                                  found by rules/BERT instead of re-deriving them,
-                                  while still catching quasi-identifiers plus any
-                                  direct identifiers those stages missed
+        detect_direct=True:      all PII including direct identifiers (llm_only mode,
+                                  or backstopping a prior pass — see scan_text)
         enable_thinking=True:    ask the model to reason in a <think> block before
                                   answering (only meaningful on backends that support
                                   it, e.g. Qwen3 — ignored by everything else)
+        scan_text:               what's shown to the model (defaults to `text`). Pass
+                                  a partially-redacted version to backstop a prior
+                                  pass — already-redacted spans are invisible to the
+                                  model, so it can only report what's still exposed
+        target_quotes:           specific excerpts to classify (e.g. a judge's flags)
+                                  instead of a blind full sweep — takes priority over
+                                  detect_direct's prompt selection when given
+        """
+        pass
+
+    @abstractmethod
+    def judge(self, redacted_text: str, enable_thinking: bool = False) -> list[dict]:
+        """
+        Audit an already-redacted document for residual PII — a different
+        task from detect(): pass/fail on the final text, not enumeration.
+        Returns a list of {"quote": ..., "reason": ...} dicts; empty means
+        the judge considers the document clean.
         """
         pass
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace backend (GPT-SW3 / EuroLLM / Llama — all use same interface)
+# HuggingFace backend (Llama / Mistral / Qwen / Gemma — all use same interface)
 # ---------------------------------------------------------------------------
 
 class HuggingFaceLLMBackend(LLMBackend):
     """
     Generic HuggingFace causal LM backend.
-    Works with GPT-SW3, EuroLLM, Llama, and most instruct-tuned models.
+    Works with Llama, Mistral, Qwen, Gemma, and most instruct-tuned models.
     """
 
-    def __init__(self, backend_name: str, model_path: str):
+    def __init__(self, backend_name: str, model_path: str, approx_params_b: float = 9.0):
         import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline as hf_pipeline
-        from device import resolve_device_map
+        from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer, pipeline as hf_pipeline
+        from device import resolve_device_map, resolve_quantization_config
 
         self.backend_name = backend_name
         logger.info(f"Loading LLM: {model_path}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        # clean_up_tokenization_spaces=True (the old default) is destructive
+        # for BPE tokenizers and warns on every decode — set explicitly
+        # rather than accept the warning on every single generation call.
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, clean_up_tokenization_spaces=False)
+        # Checks the GPU actually detected at runtime against this model's
+        # approximate size, and quantizes to 8-bit only if needed to fit —
+        # e.g. a ~32B model needs this on a 40GB card but not an 80GB one.
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map=resolve_device_map(),
+            quantization_config=resolve_quantization_config(approx_params_b),
         )
         self.model.eval()
 
@@ -232,31 +329,40 @@ class HuggingFaceLLMBackend(LLMBackend):
             model=self.model,
             tokenizer=self.tokenizer,
         )
+        # Prints generated tokens live to the terminal as they're produced —
+        # otherwise a 30-90s generation call looks like a hang.
+        self.streamer = TextStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
     def _build_prompt(
         self,
         text: str,
         existing: list[Entity],
         detect_direct: bool,
-        backstop_existing: bool = False,
         enable_thinking: bool = False,
+        target_quotes: list[str] | None = None,
     ) -> str:
-        if detect_direct and backstop_existing:
-            # Full detection, but told exactly what's already been found —
-            # skip re-deriving those spans, catch quasi-identifiers plus any
-            # direct identifiers rules/BERT missed.
-            already_found = ", ".join(dict.fromkeys(e.text for e in existing)) or "inga ännu"
-            system = FULL_DETECTION_SYSTEM
+        if target_quotes:
+            # Judge retry: don't re-run a blind full sweep and hope sampling
+            # surfaces the same miss again — give the model the judge's
+            # exact flagged excerpts and ask it to classify each one. Uses
+            # its own narrow prompt (not FULL_DETECTION_SYSTEM) — see
+            # TARGETED_CLASSIFY_SYSTEM's docstring for why that matters.
+            system = TARGETED_CLASSIFY_SYSTEM
+            quotes_list = "\n".join(f'{i+1}. "{q}"' for i, q in enumerate(target_quotes))
             user_msg = (
-                f"{FEW_SHOT_FULL}\n"
-                f"Redan identifierade (hoppa över dessa): {already_found}\n"
-                f"Identifiera ALLA ÖVRIGA direkta identifierare och quasi-identifierare "
-                f"som inte redan är med i listan ovan.\n\n"
-                f"Text: \"{text}\"\n"
+                f"{TARGETED_CLASSIFY_FEW_SHOT}\n"
+                f"Angivna utdrag:\n{quotes_list}\n\n"
+                f"Text (sammanhang — klassificera INTE något annat än utdragen ovan):\n\"{text}\"\n\n"
                 f"Entiteter:"
             )
         elif detect_direct:
-            # llm_only mode — detect everything from scratch
+            # llm_only mode — detect everything from scratch.
+            # Also used for backstop mode: the caller passes already-redacted
+            # text here (see PIIPipeline), so anything rules/BERT already
+            # caught is literally gone from what the model sees — no "skip
+            # already found" instruction needed, since there's nothing left
+            # to duplicate. Models weren't reliably following that instruction
+            # anyway; removing the need for it is more robust than asking nicer.
             system = FULL_DETECTION_SYSTEM
             user_msg = (
                 f"{FEW_SHOT_FULL}\n"
@@ -316,12 +422,31 @@ class HuggingFaceLLMBackend(LLMBackend):
         text: str,
         existing: list[Entity],
         detect_direct: bool = False,
-        backstop_existing: bool = False,
         enable_thinking: bool = False,
+        scan_text: str | None = None,
+        target_quotes: list[str] | None = None,
     ) -> list[Entity]:
-        prompt = self._build_prompt(text, existing, detect_direct, backstop_existing, enable_thinking)
+        """
+        text: original document — always used to resolve entity offsets.
+        scan_text: what's actually shown to the model (defaults to `text`).
+                   Pass a partially-redacted version to backstop a prior
+                   pass — anything already redacted is invisible to the
+                   model, so it can't re-derive duplicates of what's already
+                   been found; it can only report what's still exposed.
+        target_quotes: specific excerpts to classify (e.g. from a judge's
+                   flags), instead of a blind full sweep. Takes priority
+                   over detect_direct's prompt selection when given.
+        """
+        prompt = self._build_prompt(
+            scan_text if scan_text is not None else text,
+            existing, detect_direct, enable_thinking, target_quotes,
+        )
 
-        if enable_thinking:
+        if target_quotes:
+            # A handful of concrete items to classify — modest budget, but
+            # scaled up a bit for judge rounds that flag many things at once.
+            max_new_tokens = max(512, 200 * len(target_quotes))
+        elif enable_thinking:
             # A <think> block consumes generation budget before the actual
             # answer — reasoning models can use 5-20x more tokens per
             # response than non-reasoning ones, so this needs real headroom.
@@ -333,15 +458,7 @@ class HuggingFaceLLMBackend(LLMBackend):
         else:
             max_new_tokens = 512
 
-        output = self.pipe(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=0.1,     # low temp for consistent structured output
-            do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
-
-        generated = output[0]["generated_text"][len(prompt):]
+        generated = self._generate(prompt, max_new_tokens)
         raw_entities = _parse_llm_json(generated)
 
         entities = []
@@ -366,6 +483,35 @@ class HuggingFaceLLMBackend(LLMBackend):
 
         return entities
 
+    def judge(self, redacted_text: str, enable_thinking: bool = False) -> list[dict]:
+        user_msg = f"{JUDGE_FEW_SHOT}\nText: \"{redacted_text}\"\nBedömning:"
+        prompt = self._apply_chat_template(JUDGE_SYSTEM, user_msg, enable_thinking)
+
+        max_new_tokens = 4096 if enable_thinking else 512
+        # No live stream here: JudgePanel always prints a clean post-filter
+        # summary of what actually survives, so streaming the raw unfiltered
+        # verdict first would just show everything twice.
+        generated = self._generate(prompt, max_new_tokens, stream=False)
+        return _parse_llm_json(generated)
+
+    def _generate(self, prompt: str, max_new_tokens: int, stream: bool = True) -> str:
+        """
+        Run generation via an explicit GenerationConfig — passing loose
+        max_new_tokens/temperature/... kwargs alongside the model's own
+        generation_config.json triggers a deprecation warning on every
+        single call otherwise.
+        """
+        from transformers import GenerationConfig
+
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,     # low temp for consistent structured output
+            do_sample=True,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        output = self.pipe(prompt, generation_config=gen_config, streamer=self.streamer if stream else None)
+        return output[0]["generated_text"][len(prompt):]
+
 
 # ---------------------------------------------------------------------------
 # Mock backend (for local testing without GPU/models)
@@ -379,8 +525,9 @@ class MockLLMBackend(LLMBackend):
         text: str,
         existing: list[Entity],
         detect_direct: bool = False,
-        backstop_existing: bool = False,
         enable_thinking: bool = False,
+        scan_text: str | None = None,
+        target_quotes: list[str] | None = None,
     ) -> list[Entity]:
         entities = []
         # Simple keyword scan to simulate LLM detection
@@ -405,28 +552,47 @@ class MockLLMBackend(LLMBackend):
                 ))
         return entities
 
+    def judge(self, redacted_text: str, enable_thinking: bool = False) -> list[dict]:
+        """Always reports clean — no model to actually audit with."""
+        return []
+
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def load_llm(backend_name: str, model_path: str) -> LLMBackend:
+_loaded_backends: dict[tuple[str, str], LLMBackend] = {}
+
+
+def load_llm(backend_name: str, model_path: str, approx_params_b: float = 9.0) -> LLMBackend:
     """
     Load the appropriate LLM backend.
 
     backend_name options:
-      "gpt-sw3"  -> AI-Sweden-Models/gpt-sw3-20b-instruct  (recommended)
-      "eurollm"  -> utter-project/EuroLLM-9B-Instruct
       "llama"    -> meta-llama/Meta-Llama-3.1-8B-Instruct
+      "mistral"  -> mistralai/Mistral-7B-Instruct-v0.3
+      "qwen"     -> Qwen/Qwen3-8B (or Qwen/Qwen3-32B — same backend, bigger checkpoint)
+      "gemma"    -> google/gemma-2-9b-it
       "mock"     -> MockLLMBackend (no model, for testing)
 
     model_path can be a HuggingFace model ID or a local directory path.
+
+    approx_params_b: rough parameter count in billions, used to decide
+    whether this checkpoint needs 8-bit quantization on the GPU actually
+    detected at runtime — see device.resolve_quantization_config().
+
+    Cached by (backend_name, model_path) — calling this twice for the same
+    checkpoint (e.g. the main detection LLM also being used as a judge)
+    returns the already-loaded instance instead of loading it again.
     """
     if backend_name == "mock":
         return MockLLMBackend()
 
-    supported = {"gpt-sw3", "eurollm", "llama", "mistral", "qwen", "gemma"}
+    supported = {"llama", "mistral", "qwen", "gemma"}
     if backend_name not in supported:
         raise ValueError(f"Unknown backend '{backend_name}'. Choose from: {supported}")
 
-    return HuggingFaceLLMBackend(backend_name, model_path)
+    key = (backend_name, model_path)
+    if key not in _loaded_backends:
+        _loaded_backends[key] = HuggingFaceLLMBackend(backend_name, model_path, approx_params_b)
+    return _loaded_backends[key]

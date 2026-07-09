@@ -4,7 +4,7 @@ These patterns are fast, free, and highly reliable — no LLM needed.
 """
 
 import re
-from entities import Entity
+from entities import Entity, remove_overlapping_entities
 
 
 PATTERNS: dict[str, list[str]] = {
@@ -52,15 +52,4 @@ class RuleAgent:
                         source="rule",
                         confidence=1.0,
                     ))
-        return self._remove_overlaps(entities)
-
-    def _remove_overlaps(self, entities: list[Entity]) -> list[Entity]:
-        """Deduplicate and remove spans fully contained within a longer span."""
-        # Sort by start asc, then by span length desc (longer spans first)
-        entities.sort(key=lambda e: (e.start, -(e.end - e.start)))
-        kept: list[Entity] = []
-        for e in entities:
-            if kept and e.start >= kept[-1].start and e.end <= kept[-1].end:
-                continue  # fully contained in previous — drop
-            kept.append(e)
-        return kept
+        return remove_overlapping_entities(entities)

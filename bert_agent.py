@@ -3,7 +3,65 @@ BERT NER agent — wraps your fine-tuned ModelBERTF checkpoint.
 Handles direct identifier detection (names, structured PII the rules miss).
 """
 
-from entities import Entity
+import re
+import logging
+from entities import Entity, remove_overlapping_entities
+
+logger = logging.getLogger(__name__)
+
+# Titles/abbreviations whose trailing period must not be read as a sentence
+# end (mirrors the set of things that legitimately precede a name — see
+# bert_agent's own _is_mergeable_gap for the "Dr. Namn" merge case).
+_ABBREVIATIONS = {"dr", "prof", "fil", "med", "jur", "ex", "etc", "kl", "nr", "sid"}
+
+
+def _split_into_units(text: str) -> list[tuple[int, int]]:
+    """
+    Split text into small units that are always safe to cut between: never
+    inside a line, and never inside a sentence (skipping periods that look
+    like abbreviations rather than sentence ends). Chunking groups these
+    back up to a size budget without ever splitting one in half, so a chunk
+    boundary can't land mid-entity or strip the context immediately around one.
+    """
+    units: list[tuple[int, int]] = []
+    for line_match in re.finditer(r"[^\n]*\n?", text):
+        line_start, line_end = line_match.start(), line_match.end()
+        if line_start == line_end:
+            continue
+        line = text[line_start:line_end]
+
+        sent_start = 0
+        for m in re.finditer(r"[.!?]+(?=\s|$)", line):
+            end = m.end()
+            preceding = re.search(r"(\w+)\.?$", line[sent_start:m.start()])
+            word = preceding.group(1).lower() if preceding else ""
+            if word in _ABBREVIATIONS:
+                continue  # likely "Dr." etc — not a real sentence end
+            units.append((line_start + sent_start, line_start + end))
+            sent_start = end
+
+        if sent_start < len(line):
+            units.append((line_start + sent_start, line_end))
+
+    return [u for u in units if u[1] > u[0]]
+
+
+def chunk_by_sentences(text: str, max_chunk_chars: int) -> list[tuple[int, int]]:
+    """Group line/sentence units into chunks up to max_chunk_chars, never splitting a unit."""
+    chunks: list[tuple[int, int]] = []
+    chunk_start = None
+    chunk_end = None
+    for start, end in _split_into_units(text):
+        if chunk_start is None:
+            chunk_start, chunk_end = start, end
+        elif end - chunk_start <= max_chunk_chars:
+            chunk_end = end
+        else:
+            chunks.append((chunk_start, chunk_end))
+            chunk_start, chunk_end = start, end
+    if chunk_start is not None:
+        chunks.append((chunk_start, chunk_end))
+    return chunks
 
 
 class BERTAgent:
@@ -24,7 +82,89 @@ class BERTAgent:
         # the model could actually have handled in one pass.
         self.max_length = getattr(self.model.config, "max_position_embeddings", 512)
 
-    def detect(self, text: str) -> list[Entity]:
+    def detect(
+        self,
+        text: str,
+        chunk_size: int | None = None,
+        chunk_overlap: int = 50,
+        chunk_by: str = "sentences",
+    ) -> list[Entity]:
+        """
+        chunk_size: max characters per chunk. None (default) auto-decides —
+                    if the document's real token count fits within
+                    self.max_length it's processed in a single pass;
+                    otherwise chunks are sized as large as safely fits,
+                    computed from this tokenizer's own token->character
+                    mapping on the actual text rather than a generic
+                    chars-per-token guess (which varies by language/model).
+                    Pass an explicit value to override.
+        chunk_overlap: characters shared between consecutive windows in
+                    "chars" mode, so an entity sitting on a window boundary
+                    is fully visible in at least one window instead of being
+                    cut in half. Ignored for "sentences" mode.
+        chunk_by: "sentences" (default) — group whole lines/sentences up to
+                                the chunk size, never cutting one in half
+                                (see chunk_by_sentences) — guarantees no
+                                mid-entity cuts by construction.
+                  "chars"     — fixed-size sliding character windows.
+                                Benchmarked statistically indistinguishable
+                                from "sentences" on real accuracy at a large
+                                enough chunk size, but offers no structural
+                                guarantee against cutting mid-entity.
+        """
+        if chunk_size is None:
+            full = self.tokenizer(text, truncation=False, return_offsets_mapping=True)
+            token_count = len(full["input_ids"])
+            if token_count <= self.max_length:
+                return self._merge_fragments(text, self._detect_chunk(text, offset=0))
+
+            # Chunk as large as safely fits under max_length, with an 85%
+            # margin to absorb re-tokenization drift at chunk cut points
+            # (a chunk's own [CLS]/[SEP] and slightly different subword
+            # splits near its edges vs. the full-document tokenization).
+            safe_token_budget = max(int(self.max_length * 0.85), 1)
+            offsets = full["offset_mapping"]
+            cutoff_idx = min(safe_token_budget, len(offsets) - 1)
+            chunk_size = offsets[cutoff_idx][1] or len(text)
+            logger.info(
+                f"Document has {token_count} tokens (limit {self.max_length}) — "
+                f"chunking at ~{chunk_size} chars per chunk ({chunk_by})"
+            )
+
+        if len(text) <= chunk_size:
+            entities = self._detect_chunk(text, offset=0)
+        elif chunk_by == "sentences":
+            entities = []
+            for start, end in chunk_by_sentences(text, chunk_size):
+                entities.extend(self._detect_chunk(text[start:end], offset=start))
+            entities = remove_overlapping_entities(entities)
+        else:
+            entities = []
+            start = 0
+            step = max(chunk_size - chunk_overlap, 1)
+            while start < len(text):
+                end = min(start + chunk_size, len(text))
+                entities.extend(self._detect_chunk(text[start:end], offset=start))
+                if end == len(text):
+                    break
+                start += step
+            # Overlap regions can produce the same entity twice (once from
+            # each neighboring chunk) — resolve like any other overlap.
+            entities = remove_overlapping_entities(entities)
+
+        return self._merge_fragments(text, entities)
+
+    def _detect_chunk(self, text: str, offset: int) -> list[Entity]:
+        """Run one forward pass over `text`, offsetting spans by `offset` into the full document."""
+        token_count = len(self.tokenizer(text, truncation=False)["input_ids"])
+        if token_count > self.max_length:
+            logger.warning(
+                f"BERT input has {token_count} tokens, exceeding this model's "
+                f"{self.max_length}-token limit — {token_count - self.max_length} tokens "
+                f"will be silently dropped by truncation. Pass chunk_size to "
+                f"BERTAgent.detect() to process the whole document instead."
+            )
+
         encoding = self.tokenizer(
             text,
             return_tensors="pt",
@@ -53,7 +193,7 @@ class BERTAgent:
             if char_start == 0 and char_end == 0:
                 # Special token ([CLS], [SEP], [PAD])
                 if current:
-                    entities.append(self._finalize(current, text))
+                    entities.append(self._finalize(current, text, offset))
                     current = None
                 continue
 
@@ -61,7 +201,7 @@ class BERTAgent:
 
             if label == "O":
                 if current:
-                    entities.append(self._finalize(current, text))
+                    entities.append(self._finalize(current, text, offset))
                     current = None
                 continue
 
@@ -69,7 +209,7 @@ class BERTAgent:
 
             if prefix == "B" or (prefix == "S"):
                 if current:
-                    entities.append(self._finalize(current, text))
+                    entities.append(self._finalize(current, text, offset))
                 current = {"label": cat, "start": char_start, "end": char_end}
 
             elif prefix in ("I", "E") and current and current["label"] == cat:
@@ -78,20 +218,20 @@ class BERTAgent:
             else:
                 # Label mismatch — close current, start new
                 if current:
-                    entities.append(self._finalize(current, text))
+                    entities.append(self._finalize(current, text, offset))
                 current = {"label": cat, "start": char_start, "end": char_end}
 
         if current:
-            entities.append(self._finalize(current, text))
+            entities.append(self._finalize(current, text, offset))
 
-        return self._merge_fragments(text, entities)
+        return entities
 
-    def _finalize(self, span: dict, text: str) -> Entity:
+    def _finalize(self, span: dict, text: str, offset: int = 0) -> Entity:
         return Entity(
             text=text[span["start"]:span["end"]],
             label=span["label"],
-            start=span["start"],
-            end=span["end"],
+            start=span["start"] + offset,
+            end=span["end"] + offset,
             source="bert",
             confidence=0.95,
         )
@@ -108,6 +248,7 @@ class BERTAgent:
             (self._fix_numeric_person(self._snap_to_word_boundary(text, e)) for e in entities),
             key=lambda e: e.start,
         )
+        snapped = [e for e in snapped if not _is_bogus_email(e)]
 
         merged: list[Entity] = []
         for entity in snapped:
@@ -172,6 +313,18 @@ class BERTAgent:
 
 def _is_word_char(c: str) -> bool:
     return c.isalnum() or c == "-"
+
+
+def _is_bogus_email(entity: Entity) -> bool:
+    """
+    A real email address always contains '@' — a private_email-labeled span
+    without one is a misclassification, not a legitimate finding under any
+    category. Chunking without full-document context has been observed to
+    trigger this specifically on ordinary period-ending words near a chunk
+    boundary (e.g. "utredning.", "kyrkokören."), silently mangling readable
+    text into a wrong-category placeholder.
+    """
+    return entity.label == "private_email" and "@" not in entity.text
 
 
 def _is_mergeable_gap(gap: str) -> bool:

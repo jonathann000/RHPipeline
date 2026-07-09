@@ -4,3 +4,6 @@ datasets
 seqeval
 accelerate      # needed for device_map="auto" multi-GPU
 bitsandbytes    # optional: for 4/8-bit quantization on smaller GPUs
+pandas          # wikidata_script.py gazetteer export
+requests        # wikidata_script.py SPARQL queries
+pyahocorasick   # fast multi-pattern gazetteer matching (gazetteer_agent.py)

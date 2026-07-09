@@ -6,9 +6,8 @@
 
 set -e
 
-echo "=== Fixing container dependencies ==="
-pip uninstall -y torchaudio 2>/dev/null || true
-pip install --upgrade torchvision --quiet 2>/dev/null || true
+echo "=== Removing unused torchvision/torchaudio (pure text pipeline — never used, and torchvision's import chain has broken transformers on some Python builds) ==="
+pip uninstall -y torchaudio torchvision 2>/dev/null || true
 
 echo "=== Installing pipeline dependencies ==="
 pip install -r requirements.txt --quiet

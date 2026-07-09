@@ -12,13 +12,19 @@ Usage:
     python run.py --input notes.txt --output redacted.txt --audit audit.json --mode llm_only
 
     # Swap LLM backend
-    python run.py --input notes.txt --output redacted.txt --audit audit.json --llm eurollm
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --llm gemma
 
     # LLM also backstops direct identifiers rules/BERT missed (any mode)
     python run.py --input notes.txt --output redacted.txt --audit audit.json --llm-backstop
 
     # Qwen3 with native thinking mode enabled
     python run.py --input notes.txt --output redacted.txt --audit audit.json --llm qwen --llm-thinking
+
+    # Judge panel audits the output and retries if it flags residual PII
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --judges mistral qwen
+
+    # Gazetteer stage: fast exact-match lookup against known Swedish places
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --gazetteer sweden_entities_deid.csv
 
 Modes:
     full      Rules → BERT → LLM quasi-IDs        (default)
@@ -35,6 +41,19 @@ can be compared against each other.
 answering. Only meaningful on backends that support it (currently just
 Qwen3) — ignored by everything else. Uses significantly more output
 tokens per call, so it's off by default.
+
+--judges lists which backends form the judge panel (off/empty by default).
+Each judge reviews the redacted output; if any judge flags residual PII,
+another detection pass runs and the document is re-redacted, up to
+--judge-max-rounds times (default 2). A backend already loaded as the main
+--llm is reused rather than loaded twice. With only two judges, any single
+flag counts (real voting needs more judges to be meaningful) — see
+judge.py. Loading extra models for judges is memory-heavy; pick backends
+that together fit your available RAM alongside the main --llm.
+
+--gazetteer points at a CSV of known Swedish place/institution names (see
+wikidata_script.py to generate one). Off by default. Skipped in llm_only
+mode, like rules.
 """
 
 import argparse
@@ -46,28 +65,29 @@ from pipeline import PIIPipeline
 # -----------------------------------------------------------------------
 LLM_BACKENDS = {
     "llama": {
-        "llm_backend":    "llama",
-        "llm_model_path": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "llm_backend":     "llama",
+        "llm_model_path":  "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "approx_params_b": 8,
     },
     "mistral": {
-        "llm_backend":    "mistral",
-        "llm_model_path": "mistralai/Mistral-7B-Instruct-v0.3",
+        "llm_backend":     "mistral",
+        "llm_model_path":  "mistralai/Mistral-7B-Instruct-v0.3",
+        "approx_params_b": 7,
     },
     "qwen": {
-        "llm_backend":    "qwen",
-        "llm_model_path": "Qwen/Qwen3-8B",
+        "llm_backend":     "qwen",
+        "llm_model_path":  "Qwen/Qwen3-8B",
+        "approx_params_b": 8,
+    },
+    "qwen-32b": {
+        "llm_backend":     "qwen",
+        "llm_model_path":  "Qwen/Qwen3-32B",
+        "approx_params_b": 32,  # needs 8-bit on a 40GB card — auto-detected, see device.py
     },
     "gemma": {
-        "llm_backend":    "gemma",
-        "llm_model_path": "google/gemma-2-9b-it",
-    },
-    "gpt-sw3": {
-        "llm_backend":    "gpt-sw3",
-        "llm_model_path": "AI-Sweden-Models/gpt-sw3-20b-instruct",
-    },
-    "eurollm": {
-        "llm_backend":    "eurollm",
-        "llm_model_path": "utter-project/EuroLLM-9B-Instruct",
+        "llm_backend":     "gemma",
+        "llm_model_path":  "google/gemma-2-9b-it",
+        "approx_params_b": 9,
     },
 }
 
@@ -109,7 +129,30 @@ def main():
         action="store_true",
         help="Ask the LLM to reason in a <think> block before answering (Qwen3 only, ignored elsewhere; default: off)"
     )
+    parser.add_argument(
+        "--judges",
+        nargs="+",
+        default=[],
+        choices=list(LLM_BACKENDS.keys()),
+        help="Backends forming the judge panel that audits the redacted output (default: none — panel off)"
+    )
+    parser.add_argument(
+        "--judge-max-rounds",
+        type=int,
+        default=2,
+        help="Max detect-then-rejudge rounds before flagging for human review (default: 2)"
+    )
+    parser.add_argument(
+        "--gazetteer",
+        default=None,
+        help="Path to a CSV of known Swedish place/institution names (default: off — see wikidata_script.py)"
+    )
     args = parser.parse_args()
+
+    judge_configs = [
+        {"name": name, **LLM_BACKENDS[name]}
+        for name in args.judges
+    ]
 
     config = {
         **BASE_CONFIG,
@@ -117,8 +160,15 @@ def main():
         "mode": args.mode,
         "llm_backstop": args.llm_backstop,
         "llm_thinking": args.llm_thinking,
+        "judges": judge_configs,
+        "judge_max_rounds": args.judge_max_rounds,
+        "gazetteer_path": args.gazetteer,
     }
-    print(f"Mode: {args.mode} | LLM: {args.llm} | Backstop: {args.llm_backstop} | Thinking: {args.llm_thinking}")
+    print(
+        f"Mode: {args.mode} | LLM: {args.llm} | Backstop: {args.llm_backstop} | "
+        f"Thinking: {args.llm_thinking} | Judges: {args.judges or 'none'} | "
+        f"Gazetteer: {args.gazetteer or 'off'}"
+    )
 
     pipe = PIIPipeline(config)
 
@@ -136,6 +186,20 @@ def main():
     print(f"Done. {len(result.entities)} entities found and redacted.")
     print(f"Redacted text : {args.output}")
     print(f"Audit log     : {args.audit}")
+
+    print("\n" + "=" * 70)
+    print("REDACTED TEXT")
+    print("=" * 70)
+    print(result.redacted_text)
+
+    if result.needs_human_review:
+        print("\n" + "=" * 70)
+        print(f"NEEDS HUMAN REVIEW — judge panel still flags {len(result.judge_flags)} issue(s) after {args.judge_max_rounds} round(s):")
+        print("=" * 70)
+        for flag in result.judge_flags:
+            print(f"  [{flag['judge']}] \"{flag['quote']}\" — {flag['reason']}")
+    elif args.judges:
+        print("\nJudge panel: document is clean.")
 
 
 if __name__ == "__main__":
