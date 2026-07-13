@@ -8,41 +8,59 @@ HEADERS = {
     "User-Agent": "SwedishMedicalDeidBot/1.0 (contact: your-email@domain.com) Python/requests"
 }
 
-# Mapping of Wikidata Q-IDs to English text for clean saving
-CATEGORIES = {
+# Places: filtered by "located in Sweden" (P17) — straightforward, since a
+# hospital/street/school is physically located somewhere.
+PLACE_CATEGORIES = {
     "Q56061": "Administrative_Entity",
     "Q34442": "Street",
     "Q16917": "Hospital",
     "Q3914": "School",
 }
+PLACE_FILTER = "?entity wdt:P17 wd:Q34 ."
+
+# Names: a name isn't "located in" a country, so filtering by P17 doesn't
+# apply. Also, "has a Swedish-language label" turned out NOT to be a useful
+# proxy — Wikidata auto-fills sv labels on names regardless of actual usage
+# (tested empirically: returned entries like "Nebahat", "Femmina", clearly
+# not Swedish). What actually works: P407 "language of work or name" = Q9027
+# (Swedish) — tags the name itself as linguistically Swedish, verified to
+# return genuinely Nordic names (Börje, Karolina, Anders Gustaf, ...).
+NAME_CATEGORIES = {
+    "Q202444": "Given_Name",
+    "Q101352": "Family_Name",
+}
+NAME_FILTER = "?entity wdt:P407 wd:Q9027 ."
 
 
-def fetch_category_data(class_id):
-    """Fetches all entities for a specific class in Sweden using pagination."""
+def fetch_entities(class_id, filter_clause, limit=5000):
+    """
+    Fetches all entities for a specific Wikidata class using pagination.
+    filter_clause: SPARQL condition(s) narrowing results to ones relevant
+    for Swedish text redaction (see PLACE_FILTER / NAME_FILTER above).
+    """
     all_results = []
-    limit = 5000
     offset = 0
+    retries_left = 2
 
     print(f"Starting download for class {class_id}...")
 
     while True:
-        # Optimized SPARQL template using pagination (LIMIT/OFFSET)
         sparql_query = f"""
         SELECT ?entity ?entityLabel ?entityLabelSv WHERE {{
           {{
             SELECT DISTINCT ?entity WHERE {{
-              ?entity wdt:P17 wd:Q34 .
               ?entity wdt:P31/wdt:P279* wd:{class_id} .
+              {filter_clause}
             }}
             LIMIT {limit} OFFSET {offset}
           }}
-          OPTIONAL {{ 
-            ?entity rdfs:label ?entityLabel . 
-            FILTER(LANG(?entityLabel) = "en") 
+          OPTIONAL {{
+            ?entity rdfs:label ?entityLabel .
+            FILTER(LANG(?entityLabel) = "en")
           }}
-          OPTIONAL {{ 
-            ?entity rdfs:label ?entityLabelSv . 
-            FILTER(LANG(?entityLabelSv) = "sv") 
+          OPTIONAL {{
+            ?entity rdfs:label ?entityLabelSv .
+            FILTER(LANG(?entityLabelSv) = "sv")
           }}
         }}
         """
@@ -63,12 +81,21 @@ def fetch_category_data(class_id):
 
             all_results.extend(results)
             print(f"  Fetched {len(results)} rows (Total: {len(all_results)})")
+            retries_left = 2  # reset after a successful batch
 
             if len(results) < limit:
                 break  # Reached the end of available data
 
             offset += limit
             time.sleep(1)  # Respectful delay between hits to avoid rate-limiting
+
+        except requests.exceptions.Timeout:
+            if retries_left > 0:
+                retries_left -= 1
+                print(f"  Timeout at offset {offset}, retrying ({retries_left} left)...")
+                continue
+            print(f"  Timeout at offset {offset}, giving up after retries — data may be incomplete")
+            break
 
         except Exception as e:
             print(f"  Error fetching batch at offset {offset}: {e}")
@@ -79,8 +106,12 @@ def fetch_category_data(class_id):
 
 def main():
     all_records = []
-    for qid, cat_name in CATEGORIES.items():
-        raw_data = fetch_category_data(qid)
+    for qid, cat_name, filter_clause in [
+        (qid, cat_name, PLACE_FILTER) for qid, cat_name in PLACE_CATEGORIES.items()
+    ] + [
+        (qid, cat_name, NAME_FILTER) for qid, cat_name in NAME_CATEGORIES.items()
+    ]:
+        raw_data = fetch_entities(qid, filter_clause)
 
         for row in raw_data:
             all_records.append(

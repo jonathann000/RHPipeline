@@ -14,15 +14,18 @@ import pandas as pd
 
 from entities import Entity, remove_overlapping_entities
 
-# All categories currently map to private_address — they're all specific,
-# named real-world places, and none of our existing labels distinguish
-# "hospital" from "street" from "school". Revisit and split these out if a
-# future guideline needs finer-grained categories.
+# Place categories map to private_address — they're all specific, named
+# real-world places, and none of our existing labels distinguish "hospital"
+# from "street" from "school". Name categories map to private_person.
+# Revisit and split these out further if a future guideline needs
+# finer-grained categories.
 CATEGORY_LABELS = {
     "Administrative_Entity": "private_address",
     "Street": "private_address",
     "Hospital": "private_address",
     "School": "private_address",
+    "Given_Name": "private_person",
+    "Family_Name": "private_person",
 }
 
 # Skip very short names — a 2-3 character gazetteer entry is far more likely
