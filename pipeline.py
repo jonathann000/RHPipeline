@@ -24,6 +24,14 @@ Modes (set via config["mode"]):
   "no_bert"  — Rules → LLM only    (benchmark without BERT)
   "llm_only" — LLM only            (pure LLM baseline, no rules either)
 
+config["quasi_only"] (default False): forces the main LLM detection call to
+  quasi-identifiers only, overriding the mode-based detect_direct default
+  below. Meant for already-deidentified input (e.g. MIMIC-style data with
+  its own bracket redaction already applied) where there's nothing left for
+  rules/BERT/LLM to find as a direct identifier, and asking the LLM to hunt
+  for direct identifiers anyway just risks it misreading the existing
+  bracket placeholders as something to redact further.
+
 config["llm_backstop"] (default False), independent of mode:
   False — LLM only does the job described for its mode above (unchanged
           default behavior).
@@ -87,6 +95,7 @@ class PIIPipeline:
         self.config = config
         self.mode = config.get("mode", "full")
         self.llm_backstop = config.get("llm_backstop", False)
+        self.quasi_only = config.get("quasi_only", False)
         self.llm_thinking = config.get("llm_thinking", False)
         self.judge_max_rounds = config.get("judge_max_rounds", 2)
 
@@ -134,11 +143,13 @@ class PIIPipeline:
         #                              text already redacted so far instead, catching
         #                              anything rules/BERT missed.
         # In no_bert/llm_only mode:   LLM handles direct + quasi-identifiers (no BERT to cover direct)
+        # quasi_only forces quasi-identifiers only regardless of the above —
+        # see config["quasi_only"] docstring at the top of this file.
         scan_text = redact_document(text, all_entities) if self.llm_backstop else None
         llm_entities = self.llm.detect(
             text,
             existing=all_entities,
-            detect_direct=(self.mode in ("llm_only", "no_bert")) or self.llm_backstop,
+            detect_direct=(not self.quasi_only) and ((self.mode in ("llm_only", "no_bert")) or self.llm_backstop),
             enable_thinking=self.llm_thinking,
             scan_text=scan_text,
         )

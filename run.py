@@ -26,6 +26,9 @@ Usage:
     # Gazetteer stage: fast exact-match lookup against known Swedish places
     python run.py --input notes.txt --output redacted.txt --audit audit.json --gazetteer sweden_entities_deid.csv
 
+    # Already-deidentified input (e.g. MIMIC-style data): LLM only, quasi-IDs only
+    python run.py --input notes.txt --output redacted.txt --audit audit.json --mode llm_only --quasi-only
+
 Modes:
     full      Rules → BERT → LLM quasi-IDs        (default)
     no_bert   Rules → LLM (direct + quasi-IDs)
@@ -54,6 +57,12 @@ that together fit your available RAM alongside the main --llm.
 --gazetteer points at a CSV of known Swedish place/institution names (see
 wikidata_script.py to generate one). Off by default. Skipped in llm_only
 mode, like rules.
+
+--quasi-only forces the LLM to detect quasi-identifiers only, regardless of
+--mode. Meant for input that's already had direct identifiers stripped by
+some other process (e.g. MIMIC's own bracket redaction) — pair with
+--mode llm_only to skip rules/BERT/gazetteer entirely and avoid the LLM
+hunting for direct identifiers that aren't there.
 """
 
 import argparse
@@ -147,6 +156,11 @@ def main():
         default=None,
         help="Path to a CSV of known Swedish place/institution names (default: off — see wikidata_script.py)"
     )
+    parser.add_argument(
+        "--quasi-only",
+        action="store_true",
+        help="LLM detects quasi-identifiers only, regardless of --mode (default: off) — for input already stripped of direct identifiers"
+    )
     args = parser.parse_args()
 
     judge_configs = [
@@ -163,11 +177,12 @@ def main():
         "judges": judge_configs,
         "judge_max_rounds": args.judge_max_rounds,
         "gazetteer_path": args.gazetteer,
+        "quasi_only": args.quasi_only,
     }
     print(
         f"Mode: {args.mode} | LLM: {args.llm} | Backstop: {args.llm_backstop} | "
         f"Thinking: {args.llm_thinking} | Judges: {args.judges or 'none'} | "
-        f"Gazetteer: {args.gazetteer or 'off'}"
+        f"Gazetteer: {args.gazetteer or 'off'} | Quasi-only: {args.quasi_only}"
     )
 
     pipe = PIIPipeline(config)

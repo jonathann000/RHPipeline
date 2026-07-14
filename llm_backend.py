@@ -224,6 +224,13 @@ def _is_valid_json(s: str) -> bool:
         return False
 
 
+# A single character (e.g. the LLM reporting "f" for a "Sex: F" field) is
+# never a safe redaction target on its own — a plain substring search for it
+# is near-guaranteed to land on an unrelated occurrence elsewhere in the
+# document (e.g. the "f" in "of"), silently corrupting unrelated text.
+_MIN_ENTITY_LEN = 2
+
+
 def _resolve_offsets(
     text: str, entity_text: str, claimed: set[tuple[int, int]]
 ) -> tuple[int, int] | None:
@@ -234,7 +241,7 @@ def _resolve_offsets(
     twice) — each should resolve to its own occurrence, not collapse onto
     the first match found.
     """
-    if not entity_text:
+    if not entity_text or len(entity_text) < _MIN_ENTITY_LEN:
         return None
     search_from = 0
     while True:
@@ -437,8 +444,9 @@ class HuggingFaceLLMBackend(LLMBackend):
                    flags), instead of a blind full sweep. Takes priority
                    over detect_direct's prompt selection when given.
         """
+        scanned_text = scan_text if scan_text is not None else text
         prompt = self._build_prompt(
-            scan_text if scan_text is not None else text,
+            scanned_text,
             existing, detect_direct, enable_thinking, target_quotes,
         )
 
@@ -451,12 +459,21 @@ class HuggingFaceLLMBackend(LLMBackend):
             # answer — reasoning models can use 5-20x more tokens per
             # response than non-reasoning ones, so this needs real headroom.
             max_new_tokens = 4096
-        elif detect_direct:
-            # Full detection enumerates direct + quasi identifiers (~2x the
-            # entries of quasi-only), so it needs more headroom too.
-            max_new_tokens = 2048
         else:
-            max_new_tokens = 512
+            # A full-document sweep's JSON output grows with the document
+            # itself — a fixed ceiling silently truncates longer documents
+            # mid-array (each entity costs real generation tokens, and a
+            # long document just has more entities' worth of JSON to emit
+            # than the short documents this was originally tuned against).
+            # Scale off the actual tokenized input length rather than a
+            # flat number — correctness matters more than shaving a few
+            # generation tokens off the common case, and the model still
+            # stops early via EOS once it's actually done, so a generous
+            # ceiling doesn't cost anything when the output is short.
+            # detect_direct enumerates ~2x the entries of quasi-only, so it
+            # gets double the multiplier.
+            input_tokens = len(self.tokenizer.encode(scanned_text))
+            max_new_tokens = max(2048, input_tokens * 2) if detect_direct else max(512, input_tokens)
 
         generated = self._generate(prompt, max_new_tokens)
         raw_entities = _parse_llm_json(generated)
