@@ -72,7 +72,7 @@ ARGS=(
 [[ -n "$LLM_THINKING" ]] && ARGS+=("$LLM_THINKING")
 [[ -n "$QUASI_ONLY" ]] && ARGS+=("$QUASI_ONLY")
 
-python run.py "${ARGS[@]}"
+.venv/bin/python run.py "${ARGS[@]}"
 
 echo ""
 echo "=== Done! ==="

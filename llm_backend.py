@@ -525,6 +525,17 @@ class HuggingFaceLLMBackend(LLMBackend):
             temperature=0.1,     # low temp for consistent structured output
             do_sample=True,
             pad_token_id=self.tokenizer.eos_token_id,
+            # Hard block on repeating an exact 24-token run — guards against
+            # the model falling into a degenerate loop re-emitting the same
+            # JSON entity forever instead of finishing (measured: the fixed
+            # JSON scaffold shared between two DIFFERENT entities with the
+            # same label/risk is ~20 tokens, a real duplicated entity line
+            # is ~43 — 24 sits between the two, so two distinct entities
+            # that happen to share a label/risk/generalize combo can still
+            # both be emitted, but the same entity repeating verbatim gets
+            # cut off almost immediately instead of consuming the whole
+            # generation budget).
+            no_repeat_ngram_size=24,
         )
         output = self.pipe(prompt, generation_config=gen_config, streamer=self.streamer if stream else None)
         return output[0]["generated_text"][len(prompt):]
