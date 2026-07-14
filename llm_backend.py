@@ -64,17 +64,34 @@ Quasi-identifierare:
   {"text": "ensamstående med 3 barn", "label": "demographics", "risk": "medium", "generalize": "ensamstående förälder"},
   {"text": "Huntingtons sjukdom", "label": "medical", "risk": "high", "generalize": "sällsynt neurologisk sjukdom"}
 ]
+
+Exempel 3:
+Text: "Bor tillsammans med sin make, Dr. Nilsson, en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset."
+Quasi-identifierare:
+[
+  {"text": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "label": "social", "risk": "high", "generalize": "make med specialiserat läkaryrke vid större sjukhus"}
+]
+Notera: "Dr. Nilsson" är INTE med i listan — namnet i sig är en direkt
+identifierare (hanteras av andra steg), inte en quasi-identifierare. Flagga
+den BESKRIVANDE FRASEN (yrket + arbetsplatsen) separat, inte namnet den står
+bredvid.
 """
 
 QUASI_ID_SYSTEM = """Du är ett system för att identifiera quasi-identifierare i svenska journalanteckningar.
 Quasi-identifierare är uppgifter som ensamma kanske inte identifierar en person, men som i kombination med andra uppgifter kan göra det — särskilt i en liten svensk kommun.
+
+Detta gäller INTE bara patienten själv — ovanlig eller specifik information om
+anhöriga (make/maka, förälder, barn) räknas också, eftersom den indirekt kan
+identifiera patienten. Ett ovanligt eller framstående yrke hos en anhörig
+("en framstående barnneurolog", "kommunens enda tandläkare") är en lika stark
+quasi-identifierare som samma uppgift om patienten hade varit.
 
 Kategorier att leta efter:
 - demographics: ålder, kön, etnicitet, yrke, familjesituation
 - medical: sällsynta diagnoser, ovanliga ingrepp, specifika läkemedel
 - temporal: exakta datum, vårdtider, specifika tidpunkter
 - private_address: klinik, avdelning, stadsdel, ort
-- social: arbetsgivare, boendesituation, religiös tillhörighet
+- social: arbetsgivare, boendesituation, religiös tillhörighet, yrke eller titel hos anhöriga
 
 Returnera ENBART giltig JSON — inga förklaringar, inga markdown-block.
 Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering).
@@ -92,11 +109,13 @@ Direkta identifierare (hög risk — alltid maskera):
 - private_date:    födelsedatum, specifika vårddatum
 - secret:          lösenord, PIN-koder
 
-Quasi-identifierare (kontextberoende risk):
+Quasi-identifierare (kontextberoende risk) — gäller även ovanlig eller
+specifik information om anhöriga (make/maka, förälder, barn), inte bara
+patienten själv, eftersom det indirekt kan identifiera patienten:
 - demographics:    ålder, kön, etnicitet, yrke, familjesituation
 - medical:         sällsynta diagnoser, ovanliga ingrepp, specifika läkemedel
 - temporal:        exakta tidpunkter, vårdlängd
-- social:          arbetsgivare, boendesituation, religiös tillhörighet
+- social:          arbetsgivare, boendesituation, religiös tillhörighet, yrke eller titel hos anhöriga
 
 Returnera ENBART giltig JSON — inga förklaringar, inga markdown-block.
 Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering eller null för direkta identifierare).
@@ -113,6 +132,14 @@ Entiteter:
   {"text": "67-årig man", "label": "demographics", "risk": "medium", "generalize": "65-70 år, man"},
   {"text": "Lilla Edet", "label": "private_address", "risk": "high", "generalize": "mindre ort i Västra Götaland"},
   {"text": "snickare", "label": "demographics", "risk": "low", "generalize": "hantverkare"}
+]
+
+Exempel 2:
+Text: "Bor tillsammans med sin make, Dr. Nilsson, en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset."
+Entiteter:
+[
+  {"text": "Dr. Nilsson", "label": "private_person", "risk": "high", "generalize": null},
+  {"text": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "label": "social", "risk": "high", "generalize": "make med specialiserat läkaryrke vid större sjukhus"}
 ]
 """
 
@@ -247,11 +274,75 @@ def _resolve_offsets(
     while True:
         idx = text.find(entity_text, search_from)
         if idx == -1:
-            return None
+            return _fuzzy_find(text, entity_text, claimed)
         span = (idx, idx + len(entity_text))
         if span not in claimed:
             return span
         search_from = idx + 1
+
+
+# Minimum similarity (difflib.SequenceMatcher ratio) for a fuzzy match to be
+# trusted — high enough that it only catches near-verbatim reproductions
+# (a transcription typo, not a genuinely different phrase).
+_FUZZY_MATCH_THRESHOLD = 0.85
+
+
+def _fuzzy_find(
+    text: str, entity_text: str, claimed: set[tuple[int, int]]
+) -> tuple[int, int] | None:
+    """
+    Fallback when no exact substring match exists — the LLM occasionally
+    reproduces a span with a minor, consistent transcription error (e.g. an
+    inserted/transposed letter in a long compound word) rather than
+    verbatim. This isn't sampling noise to retry past — it's reproducible
+    across calls, so an exact match will never appear.
+
+    Finds the longest exactly-matching block shared between the document
+    and entity_text (almost always most of the phrase, since a typo is
+    usually a single localized edit) and uses its position as an anchor to
+    estimate the full span, rather than assuming entity_text's length
+    exactly matches the real span — an inserted/deleted character means it
+    won't. Snaps both boundaries outward to the nearest word boundary so a
+    length mismatch from the edit can't leave the span starting or ending
+    mid-word into unrelated, legitimate text.
+    """
+    import difflib
+
+    n = len(entity_text)
+    if n == 0 or n > len(text):
+        return None
+
+    matcher = difflib.SequenceMatcher(None, text, entity_text, autojunk=False)
+    match = matcher.find_longest_match(0, len(text), 0, n)
+    if match.size < n // 2:
+        return None  # too weak an anchor to trust
+
+    start = max(0, match.a - match.b)
+    end = min(len(text), start + n)
+
+    while 0 < start < len(text) and text[start - 1].isalnum() and text[start].isalnum():
+        start += 1
+    while 0 < end < len(text) and text[end - 1].isalnum() and text[end].isalnum():
+        end += 1
+
+    # entity_text's length is only an estimate of the real span — an
+    # inserted/deleted character in the typo means it can overshoot by a
+    # character or two onto trailing punctuation/whitespace that belongs to
+    # the surrounding sentence, not the phrase itself (e.g. swallowing the
+    # period that ends the sentence). Trim those back off the edges.
+    while end > start and not text[end - 1].isalnum():
+        end -= 1
+    while start < end and not text[start].isalnum():
+        start += 1
+
+    span = (start, end)
+    if span in claimed or start >= end:
+        return None
+
+    ratio = difflib.SequenceMatcher(None, text[start:end], entity_text).ratio()
+    if ratio >= _FUZZY_MATCH_THRESHOLD:
+        return span
+    return None
 
 
 # ---------------------------------------------------------------------------
