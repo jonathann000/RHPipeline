@@ -26,30 +26,50 @@ def resolve_device_map() -> str | dict:
 
 def resolve_quantization_config(approx_params_b: float, safety_factor: float = 1.2):
     """
-    Decide whether a model needs 8-bit quantization to safely fit the GPU
-    actually detected at runtime — checked against real hardware via
-    torch.cuda, not a guess about which variant (e.g. A100 40GB vs 80GB)
-    happens to be connected. Returns a BitsAndBytesConfig if quantization
-    is needed, else None (load in plain bf16).
+    Decide whether a model needs quantization to safely fit the GPU actually
+    detected at runtime — checked against real hardware via torch.cuda, not a
+    guess about which variant (e.g. A100 40GB vs 80GB) happens to be
+    connected. Returns a BitsAndBytesConfig if quantization is needed, else
+    None (load in plain bf16).
+
+    Three tiers, checked from least to most aggressive: bf16 (no
+    quantization) -> 8-bit -> 4-bit.
 
     approx_params_b: rough parameter count in billions for the model being
-        loaded (see LLM_BACKENDS in run.py) — used to estimate its bf16
-        memory footprint (2 bytes/param).
+        loaded (see LLM_BACKENDS in run.py) — used to estimate memory
+        footprint at each tier (2 bytes/param bf16, 1 byte/param 8-bit,
+        0.5 bytes/param 4-bit).
     safety_factor: raw weight size alone isn't the whole story — activations,
-        KV-cache, and CUDA overhead need headroom too. Requiring the GPU to
-        have 1.2x the raw bf16 weight size before trusting bf16 is what
-        correctly separates "fits on an 80GB card" from "needs quantizing on
-        a 40GB card" for a ~32B model (64GB raw -> ~77GB threshold).
+        KV-cache, and CUDA overhead need headroom too.
+
+    The 8-bit tier uses a wider margin (1.4x by default vs bf16/4-bit's
+    1.2x) based on a real failure: a ~32B model's 8-bit weights alone
+    (~32GB) fit a 40GB card under a 1.2x margin (38.4GB threshold), but
+    loading it that way actually failed — accelerate's device_map wanted to
+    offload a small piece to CPU for KV-cache/activation headroom, which
+    bitsandbytes' 8-bit path refuses without extra config. A 40GB card
+    should fall through to 4-bit instead, which is what the wider margin
+    achieves (32 * 1.4 = 44.8 > 40).
     """
     if not torch.cuda.is_available():
         return None  # quantization is a CUDA/bitsandbytes-only concern
 
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     estimated_bf16_gb = approx_params_b * 2
-    threshold_gb = estimated_bf16_gb * safety_factor
+    estimated_8bit_gb = approx_params_b * 1
+    estimated_4bit_gb = approx_params_b * 0.5
+    int8_safety_factor = safety_factor + 0.2
 
-    if total_vram_gb < threshold_gb:
-        from transformers import BitsAndBytesConfig
+    if total_vram_gb >= estimated_bf16_gb * safety_factor:
+        logger.info(
+            f"Detected {total_vram_gb:.0f}GB VRAM, ~{estimated_bf16_gb:.0f}GB "
+            f"needed in bf16 for a ~{approx_params_b:.0f}B model — loading in bf16"
+        )
+        return None
+
+    from transformers import BitsAndBytesConfig
+
+    if total_vram_gb >= estimated_8bit_gb * int8_safety_factor:
         logger.info(
             f"Detected {total_vram_gb:.0f}GB VRAM, ~{estimated_bf16_gb:.0f}GB "
             f"needed in bf16 for a ~{approx_params_b:.0f}B model — loading in 8-bit instead"
@@ -57,7 +77,12 @@ def resolve_quantization_config(approx_params_b: float, safety_factor: float = 1
         return BitsAndBytesConfig(load_in_8bit=True)
 
     logger.info(
-        f"Detected {total_vram_gb:.0f}GB VRAM, ~{estimated_bf16_gb:.0f}GB "
-        f"needed in bf16 for a ~{approx_params_b:.0f}B model — loading in bf16"
+        f"Detected {total_vram_gb:.0f}GB VRAM, ~{estimated_8bit_gb:.0f}GB needed "
+        f"in 8-bit for a ~{approx_params_b:.0f}B model — not enough headroom for "
+        f"activations/KV-cache on top of that, loading in 4-bit instead"
     )
-    return None
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+    )
