@@ -42,14 +42,21 @@ def resolve_quantization_config(approx_params_b: float, safety_factor: float = 1
     safety_factor: raw weight size alone isn't the whole story — activations,
         KV-cache, and CUDA overhead need headroom too.
 
-    The 8-bit tier uses a wider margin (1.4x by default vs bf16/4-bit's
-    1.2x) based on a real failure: a ~32B model's 8-bit weights alone
-    (~32GB) fit a 40GB card under a 1.2x margin (38.4GB threshold), but
-    loading it that way actually failed — accelerate's device_map wanted to
-    offload a small piece to CPU for KV-cache/activation headroom, which
-    bitsandbytes' 8-bit path refuses without extra config. A 40GB card
-    should fall through to 4-bit instead, which is what the wider margin
-    achieves (32 * 1.4 = 44.8 > 40).
+    The 8-bit tier uses a wider margin (1.6x by default vs bf16/4-bit's
+    1.2x) based on two real failures, not just one:
+    - A ~32B model's 8-bit weights alone (~32GB) fit a 40GB card under a
+      1.2x margin (38.4GB threshold), but loading it that way actually
+      failed — accelerate's device_map wanted to offload a small piece to
+      CPU for KV-cache/activation headroom, which bitsandbytes' 8-bit path
+      refuses without extra config.
+    - A 1.4x margin looked sufficient after that first fix, but a ~27B
+      model on a 39GB card (27 * 1.4 = 37.8 < 39, so 8-bit was still
+      selected) OOM'd anyway — this time not even at load, but partway
+      into the first generation call, when the attention softmax needed a
+      few more GB than the sliver left free. 1.4x wasn't conservative
+      enough; the real requirement here was >1.44x, so 1.6x is used to
+      leave real margin above the second observed failure, not just
+      clear it by a hair.
     """
     if not torch.cuda.is_available():
         return None  # quantization is a CUDA/bitsandbytes-only concern
@@ -58,7 +65,7 @@ def resolve_quantization_config(approx_params_b: float, safety_factor: float = 1
     estimated_bf16_gb = approx_params_b * 2
     estimated_8bit_gb = approx_params_b * 1
     estimated_4bit_gb = approx_params_b * 0.5
-    int8_safety_factor = safety_factor + 0.2
+    int8_safety_factor = safety_factor + 0.4
 
     if total_vram_gb >= estimated_bf16_gb * safety_factor:
         logger.info(
