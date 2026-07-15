@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the PHI de-identification pipeline
 # Usage: bash run_cluster.sh [--input path] [--output path] [--audit path]
-#                             [--llm llama|mistral|qwen|qwen-32b|gemma|gemma-27b|mixtral] [--mode full|no_bert|llm_only]
+#                             [--llm llama|mistral|qwen|qwen-32b|gemma|gemma-27b] [--mode full|no_bert|llm_only]
 #                             [--gazetteer path/to.csv] [--judges name1 name2 ...]
 #                             [--judge-max-rounds N] [--llm-backstop] [--llm-thinking] [--quasi-only]
 #

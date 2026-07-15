@@ -6,7 +6,6 @@ Supported backends (set via config["llm_backend"]):
   - "mistral"    : Mistral 7B Instruct
   - "qwen"       : Qwen3 8B (native thinking mode support) or Qwen3 32B
   - "gemma"      : Gemma 2 9B Instruct or Gemma 2 27B Instruct
-  - "mixtral"    : Mixtral 8x7B Instruct (mixture-of-experts)
 
 All backends use the same interface — swap by changing config only.
 
@@ -595,15 +594,12 @@ class HuggingFaceLLMBackend(LLMBackend):
             existing, detect_direct, enable_thinking, target_quotes,
         )
 
+        input_tokens = None  # computed lazily below, only when actually needed
+
         if target_quotes:
             # A handful of concrete items to classify — modest budget, but
             # scaled up a bit for judge rounds that flag many things at once.
             max_new_tokens = max(512, 200 * len(target_quotes))
-        elif enable_thinking:
-            # A <think> block consumes generation budget before the actual
-            # answer — reasoning models can use 5-20x more tokens per
-            # response than non-reasoning ones, so this needs real headroom.
-            max_new_tokens = 4096
         else:
             # A full-document sweep's JSON output grows with the document
             # itself — a fixed ceiling silently truncates longer documents
@@ -619,6 +615,24 @@ class HuggingFaceLLMBackend(LLMBackend):
             # gets double the multiplier.
             input_tokens = len(self.tokenizer.encode(scanned_text))
             max_new_tokens = max(2048, input_tokens * 2) if detect_direct else max(512, input_tokens)
+
+        if enable_thinking:
+            # A <think> block consumes real generation budget before the
+            # answer even starts, on top of whatever the answer itself
+            # needs — this used to be a flat 4096 *replacing* the length-
+            # scaled budget above, which silently starved longer documents:
+            # a ~5000-token document left a Qwen3-32B thinking run with
+            # only 5 entities, versus a dozen from a non-thinking run on
+            # the same document, because most of the 4096 went to
+            # reasoning before the JSON answer even started. Add headroom
+            # on top of the base budget instead of replacing it, scaled by
+            # input length for the same reason the base budget is — a
+            # longer document needs more room to reason about, not just a
+            # flat allowance sized for whatever document this was last
+            # tuned against.
+            if input_tokens is None:
+                input_tokens = len(self.tokenizer.encode(scanned_text))
+            max_new_tokens += max(4096, input_tokens * 2)
 
         generated = self._generate(prompt, max_new_tokens)
         raw_entities = _parse_llm_json(generated)
@@ -649,7 +663,13 @@ class HuggingFaceLLMBackend(LLMBackend):
         user_msg = f"{JUDGE_FEW_SHOT}\nText: \"{redacted_text}\"\nBedömning:"
         prompt = self._apply_chat_template(JUDGE_SYSTEM, user_msg, enable_thinking)
 
-        max_new_tokens = 4096 if enable_thinking else 512
+        max_new_tokens = 512
+        if enable_thinking:
+            # Same rationale as detect(): reasoning needs headroom on top
+            # of the answer budget, scaled by input length rather than a
+            # flat allowance that starves a long document's <think> block.
+            input_tokens = len(self.tokenizer.encode(redacted_text))
+            max_new_tokens += max(4096, input_tokens * 2)
         # No live stream here: JudgePanel always prints a clean post-filter
         # summary of what actually survives, so streaming the raw unfiltered
         # verdict first would just show everything twice.
@@ -746,7 +766,6 @@ def load_llm(backend_name: str, model_path: str, approx_params_b: float = 9.0) -
       "mistral"  -> mistralai/Mistral-7B-Instruct-v0.3
       "qwen"     -> Qwen/Qwen3-8B (or Qwen/Qwen3-32B — same backend, bigger checkpoint)
       "gemma"    -> google/gemma-2-9b-it (or google/gemma-2-27b-it — same backend, bigger checkpoint)
-      "mixtral"  -> mistralai/Mixtral-8x7B-Instruct-v0.1
       "mock"     -> MockLLMBackend (no model, for testing)
 
     model_path can be a HuggingFace model ID or a local directory path.
@@ -762,7 +781,7 @@ def load_llm(backend_name: str, model_path: str, approx_params_b: float = 9.0) -
     if backend_name == "mock":
         return MockLLMBackend()
 
-    supported = {"llama", "mistral", "qwen", "gemma", "mixtral"}
+    supported = {"llama", "mistral", "qwen", "gemma"}
     if backend_name not in supported:
         raise ValueError(f"Unknown backend '{backend_name}'. Choose from: {supported}")
 

@@ -101,16 +101,7 @@ LLM_BACKENDS = {
     "gemma-27b": {
         "llm_backend":     "gemma",
         "llm_model_path":  "google/gemma-2-27b-it",
-        "approx_params_b": 27,  # needs 8-bit on a 40GB card — auto-detected, see device.py
-    },
-    "mixtral": {
-        "llm_backend":     "mixtral",
-        "llm_model_path":  "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        # Mixture-of-experts: ~47B total params (all resident in memory
-        # regardless of routing, so this must reflect the total, not the
-        # ~13B active per token) vs an 8x7B config's ~56B naive estimate —
-        # shared attention/embedding layers across experts bring it down.
-        "approx_params_b": 47,
+        "approx_params_b": 27,  # needs 4-bit on a 40GB card — auto-detected, see device.py
     },
 }
 
