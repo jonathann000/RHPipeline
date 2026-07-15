@@ -4,8 +4,9 @@ Swappable LLM backend for PII detection.
 Supported backends (set via config["llm_backend"]):
   - "llama"      : Llama 3.1 8B Instruct (multilingual baseline)
   - "mistral"    : Mistral 7B Instruct
-  - "qwen"       : Qwen3 8B (native thinking mode support)
-  - "gemma"      : Gemma 2 9B Instruct
+  - "qwen"       : Qwen3 8B (native thinking mode support) or Qwen3 32B
+  - "gemma"      : Gemma 2 9B Instruct or Gemma 2 27B Instruct
+  - "mixtral"    : Mixtral 8x7B Instruct (mixture-of-experts)
 
 All backends use the same interface — swap by changing config only.
 
@@ -37,8 +38,15 @@ import re
 import logging
 from abc import ABC, abstractmethod
 from entities import Entity
+from redaction import PLACEHOLDERS
 
 logger = logging.getLogger(__name__)
+
+# Built from the actual PLACEHOLDERS dict rather than hand-copied — a judge
+# told about placeholders that don't match what redaction.py really produces
+# would either flag legitimate placeholders as leaks or fail to recognize a
+# real one as already-clean, and nothing would catch that drift.
+_JUDGE_PLACEHOLDER_LIST = ", ".join(sorted(set(PLACEHOLDERS.values())) + ["[REDAKTERAD]"])
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +83,20 @@ Notera: "Dr. Nilsson" är INTE med i listan — namnet i sig är en direkt
 identifierare (hanteras av andra steg), inte en quasi-identifierare. Flagga
 den BESKRIVANDE FRASEN (yrket + arbetsplatsen) separat, inte namnet den står
 bredvid.
+
+Exempel 4:
+Text: "Patienten är en av mycket få personer med samisk bakgrund som bor kvar i kommunen."
+Quasi-identifierare:
+[
+  {"text": "en av mycket få personer med samisk bakgrund som bor kvar i kommunen", "label": "demographics", "risk": "high", "generalize": "person med etnisk minoritetsbakgrund, ovanlig i kommunen"}
+]
+
+Exempel 5:
+Text: "Patienten är aktiv i det lilla samhällets enda judiska församling."
+Quasi-identifierare:
+[
+  {"text": "aktiv i det lilla samhällets enda judiska församling", "label": "social", "risk": "high", "generalize": "aktiv i en religiös minoritetsförsamling på orten"}
+]
 """
 
 QUASI_ID_SYSTEM = """Du är ett system för att identifiera quasi-identifierare i svenska journalanteckningar.
@@ -141,6 +163,20 @@ Entiteter:
   {"text": "Dr. Nilsson", "label": "private_person", "risk": "high", "generalize": null},
   {"text": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "label": "social", "risk": "high", "generalize": "make med specialiserat läkaryrke vid större sjukhus"}
 ]
+
+Exempel 3:
+Text: "Patienten är en av mycket få personer med samisk bakgrund som bor kvar i kommunen."
+Entiteter:
+[
+  {"text": "en av mycket få personer med samisk bakgrund som bor kvar i kommunen", "label": "demographics", "risk": "high", "generalize": "person med etnisk minoritetsbakgrund, ovanlig i kommunen"}
+]
+
+Exempel 4:
+Text: "Patienten är aktiv i det lilla samhällets enda judiska församling."
+Entiteter:
+[
+  {"text": "aktiv i det lilla samhällets enda judiska församling", "label": "social", "risk": "high", "generalize": "aktiv i en religiös minoritetsförsamling på orten"}
+]
 """
 
 # Used for the judge retry pass — classifying specific already-flagged
@@ -178,25 +214,38 @@ Entiteter:
   {"text": "Erik Svensson", "label": "private_person", "risk": "high", "generalize": null},
   {"text": "Lilla Edet", "label": "private_address", "risk": "high", "generalize": "mindre ort i Västra Götaland"}
 ]
+
+Exempel 2 (quasi-identifierare, inte bara direkta):
+Angivna utdrag:
+1. "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset"
+Text (sammanhang): "Bor tillsammans med sin make, Dr. Nilsson, en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset."
+Entiteter:
+[
+  {"text": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "label": "social", "risk": "high", "generalize": "make med specialiserat läkaryrke vid större sjukhus"}
+]
 """
 
 # Used by the judge panel — a different task from detection: audit a
 # document that's already been redacted, rather than enumerate entities.
-JUDGE_SYSTEM = """Du är en integritetsgranskare som kontrollerar avidentifierade svenska journalanteckningar.
+JUDGE_SYSTEM = f"""Du är en integritetsgranskare som kontrollerar avidentifierade svenska journalanteckningar.
 Dokumentet du får har redan genomgått avidentifiering — vissa uppgifter är ersatta med platshållare:
-[PERSON], [ADRESS], [TELEFON], [E-POST], [ID-NUMMER], [DATUM], [HEMLIG-UPPGIFT],
-[DEMOGRAFISK-UPPGIFT], [MEDICINSK-UPPGIFT], [TIDPUNKT], [SOCIAL-UPPGIFT], [REDAKTERAD].
+{_JUDGE_PLACEHOLDER_LIST}.
 
 Dessa platshållare räknas som redan rena — flagga dem ALDRIG.
 
-Din enda uppgift: hitta text som INTE redan är maskerad men som ändå avslöjar vem patienten
-eller andra namngivna personer i texten är — t.ex. namn, adresser, telefonnummer, e-post,
-personnummer, eller annan direkt identifierande uppgift som blivit kvar av misstag.
+Din uppgift: hitta text som INTE redan är maskerad men som ändå avslöjar vem patienten eller
+andra namngivna personer i texten är. Detta gäller två typer av kvarvarande information:
+1. Direkta identifierare: namn, adresser, telefonnummer, e-post, personnummer, eller annan
+   direkt identifierande uppgift som blivit kvar av misstag.
+2. Quasi-identifierare som är för specifika för att ha generaliserats bort: t.ex. ett ovanligt
+   eller framstående yrke hos patienten eller en anhörig, en sällsynt diagnos, eller en specifik
+   ort/institution — sådant som i kombination med annat kan avslöja vem patienten är, särskilt
+   i en liten svensk kommun.
 
 Returnera ENBART giltig JSON — en lista, inga förklaringar utanför JSON.
 Om dokumentet är rent: returnera en tom lista [].
 Om något avslöjande kvarstår, en post per fynd:
-[{"quote": "exakt textutdrag som fortfarande avslöjar identitet", "reason": "kort motivering"}]
+[{{"quote": "exakt textutdrag som fortfarande avslöjar identitet", "reason": "kort motivering"}}]
 """
 
 JUDGE_FEW_SHOT = """
@@ -205,10 +254,15 @@ Text: "Patienten [PERSON], [DEMOGRAFISK-UPPGIFT], sökte för huvudvärk. Bosatt
 Bedömning:
 []
 
-Exempel 2 (kvarvarande läckage):
+Exempel 2 (kvarvarande läckage, direkt identifierare):
 Text: "Ansvarig läkare: Dr. Helena Björk, överläkare neurologi. Patienten [PERSON] har [DATUM]."
 Bedömning:
 [{"quote": "Dr. Helena Björk", "reason": "läkarens fullständiga namn är inte maskerat"}]
+
+Exempel 3 (kvarvarande läckage, quasi-identifierare):
+Text: "Patienten [PERSON] bor med sin make, [PERSON], en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset."
+Bedömning:
+[{"quote": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "reason": "ovanligt specifikt yrke och arbetsplats för en anhörig kan indirekt identifiera patienten"}]
 """
 
 def _parse_llm_json(raw: str) -> list[dict]:
@@ -691,7 +745,8 @@ def load_llm(backend_name: str, model_path: str, approx_params_b: float = 9.0) -
       "llama"    -> meta-llama/Meta-Llama-3.1-8B-Instruct
       "mistral"  -> mistralai/Mistral-7B-Instruct-v0.3
       "qwen"     -> Qwen/Qwen3-8B (or Qwen/Qwen3-32B — same backend, bigger checkpoint)
-      "gemma"    -> google/gemma-2-9b-it
+      "gemma"    -> google/gemma-2-9b-it (or google/gemma-2-27b-it — same backend, bigger checkpoint)
+      "mixtral"  -> mistralai/Mixtral-8x7B-Instruct-v0.1
       "mock"     -> MockLLMBackend (no model, for testing)
 
     model_path can be a HuggingFace model ID or a local directory path.
@@ -707,7 +762,7 @@ def load_llm(backend_name: str, model_path: str, approx_params_b: float = 9.0) -
     if backend_name == "mock":
         return MockLLMBackend()
 
-    supported = {"llama", "mistral", "qwen", "gemma"}
+    supported = {"llama", "mistral", "qwen", "gemma", "mixtral"}
     if backend_name not in supported:
         raise ValueError(f"Unknown backend '{backend_name}'. Choose from: {supported}")
 
