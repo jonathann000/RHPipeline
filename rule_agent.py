@@ -51,5 +51,19 @@ class RuleAgent:
                         end=match.end(),
                         source="rule",
                         confidence=1.0,
+                        # Always high — these patterns only ever match
+                        # unambiguous, structured direct identifiers (exact
+                        # personnummer, phone, email, date, zip code
+                        # formats). There's no legitimate lower-risk case
+                        # for a rule match, unlike an LLM's own judgment
+                        # call. Set explicitly rather than relying on
+                        # Entity's "low" default — redaction.py's risk-based
+                        # skip for LLM quasi-identifiers is scoped away from
+                        # rule/BERT entities, but private_address isn't in
+                        # ALWAYS_DIRECT_LABELS (it's legitimately quasi when
+                        # the LLM uses it), so a rule-matched zip code
+                        # sitting at an accidental "low" default would slip
+                        # through that scoping and go unredacted.
+                        risk="high",
                     ))
         return remove_overlapping_entities(entities)

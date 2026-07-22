@@ -32,6 +32,16 @@ config["quasi_only"] (default False): forces the main LLM detection call to
   for direct identifiers anyway just risks it misreading the existing
   bracket placeholders as something to redact further.
 
+config["no_generalize"] (default False): when True, every quasi-identifier
+  falls back to its category placeholder instead of trusting the LLM's
+  suggested `generalized` text — same treatment direct identifiers already
+  get unconditionally. Trades away the informativeness a correct
+  generalization gives (e.g. "65-70 år" instead of a blunt
+  [DEMOGRAFISK-UPPGIFT]) in exchange for ruling out a generalization being
+  factually wrong in a way no other check catches (e.g. hypothyroidism —
+  a thyroid condition — generalized to a made-up description of a
+  completely different organ). See redaction.py's resolve_replacement.
+
 config["llm_backstop"] (default False), independent of mode:
   False — LLM only does the job described for its mode above (unchanged
           default behavior).
@@ -47,6 +57,19 @@ config["llm_thinking"] (default False): ask the LLM to reason in a <think>
   block before answering. Only meaningful on backends that support it
   (e.g. Qwen3) — ignored by everything else. Off by default since reasoning
   costs significantly more output tokens per call.
+
+config["llm_configs"]: a list of {"llm_backend": ..., "llm_model_path": ...,
+  "approx_params_b": ...} dicts — one entry runs a single model as usual;
+  more than one runs an ensemble. Each configured backend independently
+  runs its own Stage 3 detection pass over the same text (and, in the judge
+  retry loop, the same targeted re-detection pass); every model's findings
+  are extended into the same all_entities list and merged by the existing
+  overlap-resolution in _propagate_and_redact — no separate merge logic
+  needed, the same mechanism that already reconciles rules/BERT/LLM/
+  gazetteer entities also reconciles multiple LLMs' entities. The point is
+  recall: two models miss different things, so their union catches more
+  quasi-identifiers than either alone — at roughly Nx the LLM inference
+  cost per document for N backends.
 
 config["judges"] (default [], meaning the judge panel is off): a list of
   {"name": ..., "llm_backend": ..., "llm_model_path": ...} dicts, each
@@ -67,7 +90,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from entities import Entity, remove_overlapping_entities
+from entities import Entity, build_redaction_plan
 from bert_agent import BERTAgent
 from gazetteer_agent import GazetteerAgent
 from llm_backend import load_llm, LLMBackend
@@ -88,6 +111,11 @@ class PipelineResult:
     audit_log: list[dict] = field(default_factory=list)
     needs_human_review: bool = False
     judge_flags: list = field(default_factory=list)
+    # Populated only when config["llm_thinking"] (or a judge's own
+    # enable_thinking) is on — the model's own <think> reasoning for each
+    # detect/judge call that produced one, as an explainability trail for
+    # quasi-identifier decisions. Empty when thinking was never enabled.
+    reasoning_log: list[dict] = field(default_factory=list)
 
 
 class PIIPipeline:
@@ -96,6 +124,7 @@ class PIIPipeline:
         self.mode = config.get("mode", "full")
         self.llm_backstop = config.get("llm_backstop", False)
         self.quasi_only = config.get("quasi_only", False)
+        self.no_generalize = config.get("no_generalize", False)
         self.llm_thinking = config.get("llm_thinking", False)
         self.judge_max_rounds = config.get("judge_max_rounds", 2)
 
@@ -105,9 +134,10 @@ class PIIPipeline:
             GazetteerAgent(gazetteer_path) if gazetteer_path and self.mode != "llm_only" else None
         )
         self.bert_agent = BERTAgent(config["bert_model_path"]) if self.mode == "full" else None
-        self.llm: LLMBackend = load_llm(
-            config["llm_backend"], config["llm_model_path"], config.get("approx_params_b", 9)
-        )
+        self.llms: list[LLMBackend] = [
+            load_llm(c["llm_backend"], c["llm_model_path"], c.get("approx_params_b", 9))
+            for c in config["llm_configs"]
+        ]
 
         judge_configs = config.get("judges", [])
         self.judge_panel = JudgePanel(judges=[
@@ -124,6 +154,17 @@ class PIIPipeline:
     def run(self, text: str) -> PipelineResult:
         all_entities: list[Entity] = []
 
+        # A backend is cached and can be reused across multiple documents
+        # in one process (e.g. the CLI's judge test runs, or a long-lived
+        # server using this pipeline as a library) — clear each backend's
+        # reasoning_log now so PipelineResult.reasoning_log below reflects
+        # only this call, not leftovers from a previous document.
+        for llm in self.llms:
+            llm.reasoning_log.clear()
+        if self.judge_panel:
+            for judge in self.judge_panel.judges:
+                judge.backend.reasoning_log.clear()
+
         # --- Stage 1: Rule-based (skipped in llm_only mode) ---
         if self.rule_agent:
             rule_entities = self.rule_agent.detect(text)
@@ -133,11 +174,10 @@ class PIIPipeline:
         # --- Stage 2: BERT NER (full mode only) ---
         if self.bert_agent:
             bert_entities = self.bert_agent.detect(text)
-            bert_entities = self._deduplicate(bert_entities, all_entities)
             all_entities.extend(bert_entities)
-            logger.info(f"BERT agent found {len(bert_entities)} new entities")
+            logger.info(f"BERT agent found {len(bert_entities)} entities")
 
-        # --- Stage 3: LLM ---
+        # --- Stage 3: LLM (one or more backends — see config["llm_configs"]) ---
         # In full mode:               LLM handles quasi-identifiers only (BERT covers direct)
         #                              — unless llm_backstop is on, then it scans the
         #                              text already redacted so far instead, catching
@@ -145,17 +185,21 @@ class PIIPipeline:
         # In no_bert/llm_only mode:   LLM handles direct + quasi-identifiers (no BERT to cover direct)
         # quasi_only forces quasi-identifiers only regardless of the above —
         # see config["quasi_only"] docstring at the top of this file.
-        scan_text = redact_document(text, all_entities) if self.llm_backstop else None
-        llm_entities = self.llm.detect(
-            text,
-            existing=all_entities,
-            detect_direct=(not self.quasi_only) and ((self.mode in ("llm_only", "no_bert")) or self.llm_backstop),
-            enable_thinking=self.llm_thinking,
-            scan_text=scan_text,
-        )
-        llm_entities = self._deduplicate(llm_entities, all_entities)
-        all_entities.extend(llm_entities)
-        logger.info(f"LLM agent found {len(llm_entities)} entities")
+        # Each configured backend runs its own independent pass over the same
+        # text; every backend's findings are extended into all_entities and
+        # reconciled by the same overlap-resolution that already merges
+        # rules/BERT/gazetteer entities, in _propagate_and_redact below.
+        scan_text = redact_document(text, all_entities, self.no_generalize) if self.llm_backstop else None
+        for llm in self.llms:
+            llm_entities = llm.detect(
+                text,
+                existing=all_entities,
+                detect_direct=(not self.quasi_only) and ((self.mode in ("llm_only", "no_bert")) or self.llm_backstop),
+                enable_thinking=self.llm_thinking,
+                scan_text=scan_text,
+            )
+            all_entities.extend(llm_entities)
+            logger.info(f"LLM agent ({llm.backend_name}) found {len(llm_entities)} entities")
 
         # --- Stage 4: Gazetteer (skipped in llm_only mode, off unless configured) ---
         # Runs last among detection stages, purely as a gap-filler: it has
@@ -166,9 +210,8 @@ class PIIPipeline:
         # is a person, not a place.
         if self.gazetteer_agent:
             gazetteer_entities = self.gazetteer_agent.detect(text)
-            gazetteer_entities = self._deduplicate(gazetteer_entities, all_entities)
             all_entities.extend(gazetteer_entities)
-            logger.info(f"Gazetteer agent found {len(gazetteer_entities)} new entities")
+            logger.info(f"Gazetteer agent found {len(gazetteer_entities)} entities")
 
         # --- Stage 5 + 6: Coreference propagation, then redaction ---
         redacted = self._propagate_and_redact(text, all_entities)
@@ -191,17 +234,17 @@ class PIIPipeline:
                     judge_flags = []
                     break
                 logger.info(f"=== {len(flags)} issue(s) flagged — running targeted retry ===")
-                retry_entities = self.llm.detect(
-                    text,
-                    existing=all_entities,
-                    detect_direct=True,
-                    enable_thinking=self.llm_thinking,
-                    scan_text=redacted,
-                    target_quotes=[f.quote for f in flags],
-                )
-                retry_entities = self._deduplicate(retry_entities, all_entities)
-                all_entities.extend(retry_entities)
-                logger.info(f"Targeted retry pass found {len(retry_entities)} new entities")
+                for llm in self.llms:
+                    retry_entities = llm.detect(
+                        text,
+                        existing=all_entities,
+                        detect_direct=True,
+                        enable_thinking=self.llm_thinking,
+                        scan_text=redacted,
+                        target_quotes=[f.quote for f in flags],
+                    )
+                    all_entities.extend(retry_entities)
+                    logger.info(f"Targeted retry pass ({llm.backend_name}) found {len(retry_entities)} new entities")
                 redacted = self._propagate_and_redact(text, all_entities)
                 judge_flags = flags
             else:
@@ -220,6 +263,18 @@ class PIIPipeline:
 
         audit = self._build_audit(text, all_entities)
 
+        # Combine every ensemble LLM's reasoning with every judge's — a judge
+        # reusing a backend that's also in the ensemble (e.g. --judges mistral
+        # when mistral is also one of the --llm backends) would otherwise get
+        # counted twice, since they're the same object.
+        reasoning_log = []
+        for llm in self.llms:
+            reasoning_log.extend(llm.reasoning_log)
+        if self.judge_panel:
+            for judge in self.judge_panel.judges:
+                if judge.backend not in self.llms:
+                    reasoning_log.extend(judge.backend.reasoning_log)
+
         return PipelineResult(
             original_text=text,
             redacted_text=redacted,
@@ -230,35 +285,32 @@ class PIIPipeline:
                 {"quote": f.quote, "reason": f.reason, "judge": f.judge_name}
                 for f in judge_flags
             ],
+            reasoning_log=reasoning_log,
         )
 
     def _propagate_and_redact(self, text: str, all_entities: list[Entity]) -> str:
         """
         Coreference propagation (extends already-found entities to their
-        other mentions — repeated phrases, short-form names) followed by
-        redaction. Mutates all_entities in place with the propagated finds.
+        other mentions — repeated phrases, short-form names) over every
+        detection stage's raw output combined, then redaction. Mutates
+        all_entities in place by appending propagated entities — but,
+        deliberately, never removes or overwrites anything already in it.
+
+        Overlapping entities across stages (e.g. a gazetteer's bare
+        institution match inside a wider LLM occupation-phrase entity) are
+        NOT resolved down to one survivor here — the system's job is
+        finding as many quasi-identifiers as possible, so a distinct
+        finding should never silently disappear from all_entities (and so
+        from the audit/Label Studio export) just because it overlaps a
+        different one. Conflict resolution only happens for the actual
+        redacted text, via build_redaction_plan, which is computed
+        separately and doesn't touch all_entities itself.
         """
         propagated_entities = propagate_entities(text, all_entities)
         all_entities.extend(propagated_entities)
         logger.info(f"Coreference propagation found {len(propagated_entities)} additional entities")
-        return redact_document(text, all_entities)
-
-    def _deduplicate(self, new: list[Entity], existing: list[Entity]) -> list[Entity]:
-        """
-        Remove entities that overlap with already-found spans. Also resolves
-        overlaps within `new` itself first — a single detection call can
-        return overlapping/nested entities (e.g. a name plus name+title),
-        which would otherwise corrupt redaction's reverse-order offsets.
-        """
-        new = remove_overlapping_entities(new)
-        existing_spans = {(e.start, e.end) for e in existing}
-        return [
-            e for e in new
-            if not any(
-                e.start < ex_end and e.end > ex_start
-                for ex_start, ex_end in existing_spans
-            )
-        ]
+        redaction_plan = build_redaction_plan(text, all_entities)
+        return redact_document(text, redaction_plan, self.no_generalize)
 
     def _build_audit(self, text: str, entities: list[Entity]) -> list[dict]:
         return [
@@ -270,7 +322,7 @@ class PIIPipeline:
                 "end": e.end,
                 "source": e.source,
                 "risk": e.risk,
-                "generalized_to": resolve_replacement(e),
+                "generalized_to": resolve_replacement(e, self.no_generalize),
             }
             for e in sorted(entities, key=lambda x: x.start)
         ]

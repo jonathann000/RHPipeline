@@ -132,6 +132,10 @@ class GazetteerAgent:
                 end=end,
                 source="gazetteer",
                 confidence=0.9,
+                # Always high — a Wikidata-matched place/institution name is
+                # a direct-identifier finding, not a graded judgment call.
+                # See rule_agent.py's identical reasoning.
+                risk="high",
             ))
         return remove_overlapping_entities(entities)
 

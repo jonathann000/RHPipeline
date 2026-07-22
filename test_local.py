@@ -10,8 +10,7 @@ from pipeline import PIIPipeline
 
 CONFIG = {
     "mode": "no_bert",
-    "llm_backend": "mock",
-    "llm_model_path": "",       # unused by mock
+    "llm_configs": [{"llm_backend": "mock", "llm_model_path": ""}],  # model_path unused by mock
     "bert_model_path": "",      # unused in no_bert mode
 }
 

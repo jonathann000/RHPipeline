@@ -1,7 +1,8 @@
 """
 Swappable LLM backend for PII detection.
 
-Supported backends (set via config["llm_backend"]):
+Supported backends (set via config["llm_configs"], a list — one entry runs
+a single model, more than one runs an ensemble, see pipeline.py):
   - "llama"      : Llama 3.1 8B Instruct (multilingual baseline)
   - "mistral"    : Mistral 7B Instruct
   - "qwen"       : Qwen3 8B (native thinking mode support) or Qwen3 32B
@@ -36,8 +37,9 @@ import json
 import re
 import logging
 from abc import ABC, abstractmethod
-from entities import Entity
+from entities import Entity, remove_overlapping_entities
 from redaction import PLACEHOLDERS
+from chunking import chunk_by_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -96,26 +98,60 @@ Quasi-identifierare:
 [
   {"text": "aktiv i det lilla samhällets enda judiska församling", "label": "social", "risk": "high", "generalize": "aktiv i en religiös minoritetsförsamling på orten"}
 ]
+
+Exempel 6:
+Text: "Patienten behandlas med Levofloxacin för en misstänkt sällsynt lungsjukdom."
+Quasi-identifierare:
+[
+  {"text": "Levofloxacin", "label": "medication", "risk": "low", "generalize": null},
+  {"text": "en misstänkt sällsynt lungsjukdom", "label": "medical", "risk": "high", "generalize": "en ovanlig lungsjukdom"}
+]
+Notera: läkemedelsnamnet flaggas (label: medication) men generaliseras INTE
+— generalize är null och texten behålls oförändrad i dokumentet. Ett vanligt
+läkemedelsnamn avslöjar inte i sig vem patienten är, till skillnad från en
+sällsynt diagnos (label: medical), som fortfarande ska generaliseras.
 """
 
 QUASI_ID_SYSTEM = """Du är ett system för att identifiera quasi-identifierare i svenska journalanteckningar.
 Quasi-identifierare är uppgifter som ensamma kanske inte identifierar en person, men som i kombination med andra uppgifter kan göra det — särskilt i en liten svensk kommun.
 
+Central fråga för VARJE uppgift du överväger, oavsett kategori: hur många
+andra personer i en svensk kommun eller på detta sjukhus skulle troligen ha
+exakt samma egenskap?
+- Väldigt få (ett ovanligt eller framstående yrke, en sällsynt diagnos, en
+  ovanlig kombination av fakta) — DÅ är det en quasi-identifierare, även om
+  den inte liknar något exempel nedan.
+- De flesta patienter med liknande vårdbehov (normala vitalparametrar som
+  blodtryck/puls/andningsfrekvens inom normalvärden, vanliga sjukdomar som
+  högt blodtryck eller depression, vanliga mediciner, normala eller
+  negativa undersökningsfynd) — DÅ är det INTE en quasi-identifierare, hur
+  specifikt eller tekniskt det än låter. Ett exakt tal (t.ex. "142/76" eller
+  "leukocyter 19") är i sig INTE identifierande bara för att det är ett tal
+  — fråga dig om just DETTA värde är ovanligt för denna typ av patient.
+
 Detta gäller INTE bara patienten själv — ovanlig eller specifik information om
 anhöriga (make/maka, förälder, barn) räknas också, eftersom den indirekt kan
 identifiera patienten. Ett ovanligt eller framstående yrke hos en anhörig
-("en framstående barnneurolog", "kommunens enda tandläkare") är en lika stark
-quasi-identifierare som samma uppgift om patienten hade varit.
+("en framstående barnneurolog", "en välkänd hjärtkirurg", "kommunens enda
+tandläkare") är en lika stark quasi-identifierare som samma uppgift om
+patienten hade varit — oavsett vilket yrke eller vilken arbetsplats det
+gäller i just detta fall.
 
 Kategorier att leta efter:
 - demographics: ålder, kön, etnicitet, yrke, familjesituation
-- medical: sällsynta diagnoser, ovanliga ingrepp, specifika läkemedel
+- medical: sällsynta diagnoser, ovanliga ingrepp
 - temporal: exakta datum, vårdtider, specifika tidpunkter
 - private_address: klinik, avdelning, stadsdel, ort
 - social: arbetsgivare, boendesituation, religiös tillhörighet, yrke eller titel hos anhöriga
+- medication: läkemedelsnamn — flagga dessa så de syns i granskningsloggen,
+  men generalize ska alltid vara null. Läkemedelsnamn är i sig sällan
+  identifierande (vanliga mediciner som antibiotika eller astmainhalatorer
+  säger inte vem patienten är) och är ofta viktiga att bevara oförändrade
+  för analys- eller forskningssyften — de ska INTE ersättas med en
+  läkemedelsklass eller generaliserad beskrivning.
 
 Returnera ENBART giltig JSON — inga förklaringar, inga markdown-block.
-Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering).
+Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering, eller null för medication).
 """
 
 # Used in llm_only / no_bert modes — LLM detects everything
@@ -132,14 +168,31 @@ Direkta identifierare (hög risk — alltid maskera):
 
 Quasi-identifierare (kontextberoende risk) — gäller även ovanlig eller
 specifik information om anhöriga (make/maka, förälder, barn), inte bara
-patienten själv, eftersom det indirekt kan identifiera patienten:
+patienten själv, eftersom det indirekt kan identifiera patienten.
+
+Central fråga för VARJE uppgift du överväger, oavsett kategori: hur många
+andra personer i en svensk kommun eller på detta sjukhus skulle troligen ha
+exakt samma egenskap? Väldigt få (ett ovanligt eller framstående yrke — hos
+patienten ELLER en anhörig — en sällsynt diagnos, en ovanlig kombination av
+fakta) betyder att det är en quasi-identifierare, även om den inte liknar
+något exempel nedan. De flesta patienter med liknande vårdbehov (normala
+vitalparametrar, vanliga sjukdomar som högt blodtryck eller depression,
+vanliga mediciner, normala eller negativa undersökningsfynd) betyder att
+det INTE är en quasi-identifierare, hur specifikt eller tekniskt det än
+låter — ett exakt tal är inte i sig identifierande bara för att det är ett
+tal.
+
 - demographics:    ålder, kön, etnicitet, yrke, familjesituation
-- medical:         sällsynta diagnoser, ovanliga ingrepp, specifika läkemedel
+- medical:         sällsynta diagnoser, ovanliga ingrepp
 - temporal:        exakta tidpunkter, vårdlängd
 - social:          arbetsgivare, boendesituation, religiös tillhörighet, yrke eller titel hos anhöriga
+- medication:      läkemedelsnamn — flagga för granskningsloggen men generalize
+                   ska alltid vara null; vanliga läkemedelsnamn är sällan
+                   identifierande och är ofta viktiga att bevara oförändrade
+                   för analys- eller forskningssyften
 
 Returnera ENBART giltig JSON — inga förklaringar, inga markdown-block.
-Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering eller null för direkta identifierare).
+Varje entitet ska ha: text, label, risk (low/medium/high), generalize (föreslagen generalisering eller null för direkta identifierare/medication).
 """
 
 FEW_SHOT_FULL = """
@@ -176,6 +229,18 @@ Entiteter:
 [
   {"text": "aktiv i det lilla samhällets enda judiska församling", "label": "social", "risk": "high", "generalize": "aktiv i en religiös minoritetsförsamling på orten"}
 ]
+
+Exempel 5:
+Text: "Patienten behandlas med Levofloxacin för en misstänkt sällsynt lungsjukdom."
+Entiteter:
+[
+  {"text": "Levofloxacin", "label": "medication", "risk": "low", "generalize": null},
+  {"text": "en misstänkt sällsynt lungsjukdom", "label": "medical", "risk": "high", "generalize": "en ovanlig lungsjukdom"}
+]
+Notera: läkemedelsnamnet flaggas (label: medication) men generaliseras INTE
+— generalize är null och texten behålls oförändrad i dokumentet. Ett vanligt
+läkemedelsnamn avslöjar inte i sig vem patienten är, till skillnad från en
+sällsynt diagnos (label: medical), som fortfarande ska generaliseras.
 """
 
 # Used for the judge retry pass — classifying specific already-flagged
@@ -193,6 +258,8 @@ Direkta identifierare (generalize ska alltid vara null):
 - private_person, private_email, private_phone, account_number, private_address, private_date, secret
 Quasi-identifierare (generalize: en riktig generalisering som INTE innehåller den ursprungliga texten):
 - demographics, medical, temporal, social
+Läkemedelsnamn (generalize ska alltid vara null — behålls oförändrat, flaggas bara för spårning):
+- medication
 
 Ditt enda jobb: klassificera VARJE angivet utdrag nedan. Lägg INTE till några
 andra fynd, även om du ser annan information i den bifogade texten — texten
@@ -241,6 +308,10 @@ andra namngivna personer i texten är. Detta gäller två typer av kvarvarande i
    ort/institution — sådant som i kombination med annat kan avslöja vem patienten är, särskilt
    i en liten svensk kommun.
 
+Läkemedelsnamn som förekommer oförändrat i texten (t.ex. "Levofloxacin", "Aspirin") är INTE ett
+fynd — de flaggas medvetet inte bort, eftersom de sällan är identifierande i sig och är viktiga
+att bevara för analys. Flagga dem ALDRIG.
+
 Returnera ENBART giltig JSON — en lista, inga förklaringar utanför JSON.
 Om dokumentet är rent: returnera en tom lista [].
 Om något avslöjande kvarstår, en post per fynd:
@@ -263,6 +334,17 @@ Text: "Patienten [PERSON] bor med sin make, [PERSON], en framstående barnneurol
 Bedömning:
 [{"quote": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "reason": "ovanligt specifikt yrke och arbetsplats för en anhörig kan indirekt identifiera patienten"}]
 """
+
+def _extract_thinking(raw: str) -> str | None:
+    """
+    Pull out a <think>...</think> reasoning block's content, if present —
+    call this before _parse_llm_json, which strips the same block to get
+    at the JSON payload. Used to persist the model's reasoning for
+    explainability rather than just discarding it once parsing is done.
+    """
+    match = re.search(r"<think>(.*?)</think>", raw, flags=re.DOTALL)
+    return match.group(1).strip() if match else None
+
 
 def _parse_llm_json(raw: str) -> list[dict]:
     """
@@ -310,6 +392,41 @@ def _is_valid_json(s: str) -> bool:
 # document (e.g. the "f" in "of"), silently corrupting unrelated text.
 _MIN_ENTITY_LEN = 2
 
+# Target chunk size (characters) for quasi-identifier detection sweeps —
+# not a technical necessity like BERT's hard context limit (this model can
+# read the whole document in one pass), but an empirically-motivated
+# choice: the same prompt that reliably caught a quasi-identifier in a
+# short, isolated test sentence missed it 4/4 times embedded in a ~12KB
+# document — real evidence that a narrower per-call scope measurably helps
+# recall even though nothing forces it. A first attempt at 800 chars was
+# too narrow in practice — cutting a vitals/lab-values section down to a
+# couple of bare sentences removed the surrounding context that signals
+# "this is routine clinical data," and the model started flagging nearly
+# every bare number as some quasi-identifier category instead. Sized here
+# to data/notes.txt's full length (~1800 chars) — the original short test
+# document this pipeline was tuned against from the start, and a size
+# large enough to keep a full clinical section's context together.
+_QUASI_CHUNK_CHARS = 1800
+
+
+def _word_boundaries_ok(text: str, start: int, end: int) -> bool:
+    """
+    True if [start, end) isn't glued to more word characters on either side —
+    same check as gazetteer_agent.py's _is_plausible_match. An exact
+    substring match can still be wrong: the LLM occasionally quotes only the
+    head noun of a Swedish compound (e.g. "neurolog" instead of the intended
+    "barnneurolog"), and a plain text.find() then happily matches that
+    fragment inside a completely unrelated word elsewhere in the document
+    (e.g. "neurologiska" in a symptom list) — silently redacting the wrong
+    sentence while leaving the real target untouched. Rejecting a
+    mid-word match forces the search to keep looking for an actual
+    whole-word/phrase occurrence instead of accepting the first coincidental
+    substring hit.
+    """
+    before_ok = start == 0 or not text[start - 1].isalnum()
+    after_ok = end == len(text) or not text[end].isalnum()
+    return before_ok and after_ok
+
 
 def _resolve_offsets(
     text: str, entity_text: str, claimed: set[tuple[int, int]]
@@ -329,7 +446,7 @@ def _resolve_offsets(
         if idx == -1:
             return _fuzzy_find(text, entity_text, claimed)
         span = (idx, idx + len(entity_text))
-        if span not in claimed:
+        if span not in claimed and _word_boundaries_ok(text, *span):
             return span
         search_from = idx + 1
 
@@ -403,6 +520,15 @@ def _fuzzy_find(
 # ---------------------------------------------------------------------------
 
 class LLMBackend(ABC):
+    # Every concrete backend must set these (HuggingFaceLLMBackend and
+    # MockLLMBackend both do, in __init__) — declared here so callers typed
+    # against the abstract base (e.g. pipeline.py's self.llms: list[LLMBackend])
+    # can reference them.
+    backend_name: str
+    # Populated only when enable_thinking is on and the model actually
+    # produced a <think> block; see detect()/judge().
+    reasoning_log: list[dict]
+
     @abstractmethod
     def detect(
         self,
@@ -483,6 +609,14 @@ class HuggingFaceLLMBackend(LLMBackend):
         # Prints generated tokens live to the terminal as they're produced —
         # otherwise a 30-90s generation call looks like a hang.
         self.streamer = TextStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        # Populated only when enable_thinking is on and the model actually
+        # produced a <think> block — see _detect_once/judge. Explainability
+        # trail for quasi-identifier decisions, not used by detection logic
+        # itself. Cleared at the start of each PIIPipeline.run() (a cached
+        # backend can be reused across multiple documents in one process),
+        # so it always reflects only the most recent run.
+        self.reasoning_log: list[dict] = []
 
     def _build_prompt(
         self,
@@ -587,8 +721,62 @@ class HuggingFaceLLMBackend(LLMBackend):
         target_quotes: specific excerpts to classify (e.g. from a judge's
                    flags), instead of a blind full sweep. Takes priority
                    over detect_direct's prompt selection when given.
+
+        Quasi-only blind sweeps (not target_quotes, not detect_direct) are
+        split into sentence-group chunks once the scanned text exceeds
+        _QUASI_CHUNK_CHARS — see that constant's comment for why. Targeted
+        classification and full detect_direct sweeps are never chunked:
+        the former is already scoped to specific excerpts, and there's no
+        evidence yet the latter needs it — direct identifiers like names
+        and dates are far more mechanically obvious regardless of how much
+        surrounding text competes for the model's attention.
         """
         scanned_text = scan_text if scan_text is not None else text
+
+        if not target_quotes and not detect_direct and len(scanned_text) > _QUASI_CHUNK_CHARS:
+            claimed_spans: set[tuple[int, int]] = set()
+            entities = []
+            for start, end in chunk_by_sentences(scanned_text, _QUASI_CHUNK_CHARS):
+                entities.extend(self._detect_once(
+                    text, scanned_text[start:end], existing, detect_direct,
+                    enable_thinking, target_quotes=None, claimed_spans=claimed_spans,
+                ))
+            # Chunks are non-overlapping by construction, so this doesn't
+            # dedupe chunk-vs-chunk — it catches an entity that also got
+            # separately found by rules/BERT/a prior pass (all now resolved
+            # together downstream too, but this keeps this stage's own
+            # output clean for logging/testing in isolation).
+            return remove_overlapping_entities(entities)
+
+        return self._detect_once(
+            text, scanned_text, existing, detect_direct, enable_thinking,
+            target_quotes, claimed_spans=set(),
+        )
+
+    def _detect_once(
+        self,
+        text: str,
+        scanned_text: str,
+        existing: list[Entity],
+        detect_direct: bool,
+        enable_thinking: bool,
+        target_quotes: list[str] | None,
+        claimed_spans: set[tuple[int, int]],
+    ) -> list[Entity]:
+        """
+        A single model call over `scanned_text` — the whole document when
+        not chunking, or one chunk's substring when chunking. Offsets are
+        always resolved against the full `text`, never `scanned_text`
+        directly: `_resolve_offsets`/`_fuzzy_find` do a content-based
+        search (substring/fuzzy match), not a position-based one, so they
+        don't need to know which slice of the document the model was
+        actually looking at — they just need the full text to search
+        within. `claimed_spans` is threaded in (rather than always starting
+        fresh) so that across multiple chunk calls, two genuinely distinct
+        occurrences of the same repeated phrase each still resolve to their
+        own position instead of every chunk independently collapsing onto
+        the first occurrence in the whole document.
+        """
         prompt = self._build_prompt(
             scanned_text,
             existing, detect_direct, enable_thinking, target_quotes,
@@ -601,18 +789,18 @@ class HuggingFaceLLMBackend(LLMBackend):
             # scaled up a bit for judge rounds that flag many things at once.
             max_new_tokens = max(512, 200 * len(target_quotes))
         else:
-            # A full-document sweep's JSON output grows with the document
-            # itself — a fixed ceiling silently truncates longer documents
-            # mid-array (each entity costs real generation tokens, and a
-            # long document just has more entities' worth of JSON to emit
-            # than the short documents this was originally tuned against).
-            # Scale off the actual tokenized input length rather than a
-            # flat number — correctness matters more than shaving a few
-            # generation tokens off the common case, and the model still
-            # stops early via EOS once it's actually done, so a generous
-            # ceiling doesn't cost anything when the output is short.
-            # detect_direct enumerates ~2x the entries of quasi-only, so it
-            # gets double the multiplier.
+            # A full-document (or chunk) sweep's JSON output grows with the
+            # scanned text itself — a fixed ceiling silently truncates
+            # longer input mid-array (each entity costs real generation
+            # tokens, and more input just has more entities' worth of JSON
+            # to emit than the short documents this was originally tuned
+            # against). Scale off the actual tokenized input length rather
+            # than a flat number — correctness matters more than shaving a
+            # few generation tokens off the common case, and the model
+            # still stops early via EOS once it's actually done, so a
+            # generous ceiling doesn't cost anything when the output is
+            # short. detect_direct enumerates ~2x the entries of
+            # quasi-only, so it gets double the multiplier.
             input_tokens = len(self.tokenizer.encode(scanned_text))
             max_new_tokens = max(2048, input_tokens * 2) if detect_direct else max(512, input_tokens)
 
@@ -635,10 +823,18 @@ class HuggingFaceLLMBackend(LLMBackend):
             max_new_tokens += max(4096, input_tokens * 2)
 
         generated = self._generate(prompt, max_new_tokens)
+        if enable_thinking:
+            reasoning = _extract_thinking(generated)
+            if reasoning:
+                self.reasoning_log.append({
+                    "stage": "detect",
+                    "backend": self.backend_name,
+                    "scanned_text": scanned_text,
+                    "reasoning": reasoning,
+                })
         raw_entities = _parse_llm_json(generated)
 
         entities = []
-        claimed_spans: set[tuple[int, int]] = set()
         for ent in raw_entities:
             offsets = _resolve_offsets(text, ent.get("text", ""), claimed_spans)
             if offsets is None:
@@ -674,6 +870,15 @@ class HuggingFaceLLMBackend(LLMBackend):
         # summary of what actually survives, so streaming the raw unfiltered
         # verdict first would just show everything twice.
         generated = self._generate(prompt, max_new_tokens, stream=False)
+        if enable_thinking:
+            reasoning = _extract_thinking(generated)
+            if reasoning:
+                self.reasoning_log.append({
+                    "stage": "judge",
+                    "backend": self.backend_name,
+                    "scanned_text": redacted_text,
+                    "reasoning": reasoning,
+                })
         return _parse_llm_json(generated)
 
     def _generate(self, prompt: str, max_new_tokens: int, stream: bool = True) -> str:
@@ -712,6 +917,13 @@ class HuggingFaceLLMBackend(LLMBackend):
 
 class MockLLMBackend(LLMBackend):
     """Returns hardcoded quasi-identifiers for pipeline integration testing."""
+
+    def __init__(self):
+        self.backend_name = "mock"
+        # Always empty — no real model, so nothing to reason about. Present
+        # so code that reads self.llm.reasoning_log works the same
+        # regardless of which backend is loaded.
+        self.reasoning_log: list[dict] = []
 
     def detect(
         self,

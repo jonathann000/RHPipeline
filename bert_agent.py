@@ -3,65 +3,58 @@ BERT NER agent — wraps your fine-tuned ModelBERTF checkpoint.
 Handles direct identifier detection (names, structured PII the rules miss).
 """
 
-import re
 import logging
 from entities import Entity, remove_overlapping_entities
+from chunking import chunk_by_sentences
 
 logger = logging.getLogger(__name__)
 
-# Titles/abbreviations whose trailing period must not be read as a sentence
-# end (mirrors the set of things that legitimately precede a name — see
-# bert_agent's own _is_mergeable_gap for the "Dr. Namn" merge case).
-_ABBREVIATIONS = {"dr", "prof", "fil", "med", "jur", "ex", "etc", "kl", "nr", "sid"}
+# Minimum softmax confidence to trust a non-O tag prediction — see its use
+# in _detect_chunk for the empirical measurement behind this value.
+_MIN_TAG_CONFIDENCE = 0.75
 
-
-def _split_into_units(text: str) -> list[tuple[int, int]]:
-    """
-    Split text into small units that are always safe to cut between: never
-    inside a line, and never inside a sentence (skipping periods that look
-    like abbreviations rather than sentence ends). Chunking groups these
-    back up to a size budget without ever splitting one in half, so a chunk
-    boundary can't land mid-entity or strip the context immediately around one.
-    """
-    units: list[tuple[int, int]] = []
-    for line_match in re.finditer(r"[^\n]*\n?", text):
-        line_start, line_end = line_match.start(), line_match.end()
-        if line_start == line_end:
-            continue
-        line = text[line_start:line_end]
-
-        sent_start = 0
-        for m in re.finditer(r"[.!?]+(?=\s|$)", line):
-            end = m.end()
-            preceding = re.search(r"(\w+)\.?$", line[sent_start:m.start()])
-            word = preceding.group(1).lower() if preceding else ""
-            if word in _ABBREVIATIONS:
-                continue  # likely "Dr." etc — not a real sentence end
-            units.append((line_start + sent_start, line_start + end))
-            sent_start = end
-
-        if sent_start < len(line):
-            units.append((line_start + sent_start, line_end))
-
-    return [u for u in units if u[1] > u[0]]
-
-
-def chunk_by_sentences(text: str, max_chunk_chars: int) -> list[tuple[int, int]]:
-    """Group line/sentence units into chunks up to max_chunk_chars, never splitting a unit."""
-    chunks: list[tuple[int, int]] = []
-    chunk_start = None
-    chunk_end = None
-    for start, end in _split_into_units(text):
-        if chunk_start is None:
-            chunk_start, chunk_end = start, end
-        elif end - chunk_start <= max_chunk_chars:
-            chunk_end = end
-        else:
-            chunks.append((chunk_start, chunk_end))
-            chunk_start, chunk_end = start, end
-    if chunk_start is not None:
-        chunks.append((chunk_start, chunk_end))
-    return chunks
+# Maps a checkpoint's own raw category names to this pipeline's internal
+# label taxonomy, so redaction.py/entities.py never need to know which BERT
+# model produced an entity. The older ModelBERTF/Roberta checkpoint already
+# emits our internal names directly (private_person, private_email, ...) —
+# those aren't in this dict, so .get(cat, cat) passes them through
+# unchanged. The newer MBERTHIPAA checkpoint (HIPAA Safe Harbor's 18
+# identifier categories) uses its own vocabulary, mapped here:
+# - SSN/Med_Num/HPV_Num/Account_Num/Liscense_Num all collapse to
+#   account_number — each is a different flavor of "unique ID number", the
+#   same bucket rule_agent.py already uses for personnummer/passport
+#   numbers, so this is consistent with existing precedent, not a new idea.
+# - Fax collapses to private_phone — a fax number is redacted for the same
+#   reason and the same way as a phone number; a separate category buys
+#   nothing.
+# - Vehicle/Device_Num/URL/IP/Bio/Face are genuinely new concepts this
+#   pipeline had no bucket for at all — given dedicated categories (see
+#   ALWAYS_DIRECT_LABELS/PLACEHOLDERS) rather than being crammed into an
+#   unrelated existing one.
+# - "etc" is HIPAA Safe Harbor's own catch-all ("any other unique
+#   identifying number, characteristic, or code") — mapped to a matching
+#   catch-all here rather than reusing "secret", which already means
+#   something more specific (passwords/PINs) in this pipeline.
+_BERT_LABEL_MAP = {
+    "Name": "private_person",
+    "Address": "private_address",
+    "Dates": "private_date",
+    "Phone": "private_phone",
+    "Fax": "private_phone",
+    "Email": "private_email",
+    "SSN": "account_number",
+    "Med_Num": "account_number",
+    "HPV_Num": "account_number",
+    "Account_Num": "account_number",
+    "Liscense_Num": "account_number",
+    "Vehicle": "private_vehicle",
+    "Device_Num": "private_device",
+    "URL": "private_url",
+    "IP": "private_ip",
+    "Bio": "private_biometric",
+    "Face": "private_photo",
+    "etc": "private_other",
+}
 
 
 class BERTAgent:
@@ -181,14 +174,15 @@ class BERTAgent:
             logits = self.model(**encoding).logits[0]
 
         predicted_ids = logits.argmax(dim=-1).tolist()
+        confidences = torch.softmax(logits, dim=-1).max(dim=-1).values.tolist()
         id2label = self.model.config.id2label
 
         # Collapse B/I spans into single entities
         entities = []
         current: dict | None = None
 
-        for idx, (pred_id, (char_start, char_end)) in enumerate(
-            zip(predicted_ids, offset_mapping)
+        for idx, (pred_id, conf, (char_start, char_end)) in enumerate(
+            zip(predicted_ids, confidences, offset_mapping)
         ):
             if char_start == 0 and char_end == 0:
                 # Special token ([CLS], [SEP], [PAD])
@@ -199,6 +193,16 @@ class BERTAgent:
 
             label = id2label[pred_id]
 
+            # A prediction only barely above chance shouldn't be trusted as
+            # a real tag — measured empirically on MBERTHIPAA: genuine
+            # entities (names, phone numbers) sit at 0.95-1.0 confidence,
+            # while observed false positives (plain numbers in a lab-value
+            # list misread as Address) sat at 0.57-0.65. Treating a
+            # low-confidence non-O prediction as O closes that specific,
+            # measured gap instead of guessing at a threshold.
+            if label != "O" and conf < _MIN_TAG_CONFIDENCE:
+                label = "O"
+
             if label == "O":
                 if current:
                     entities.append(self._finalize(current, text, offset))
@@ -206,6 +210,7 @@ class BERTAgent:
                 continue
 
             prefix, cat = label.split("-", 1)
+            cat = _BERT_LABEL_MAP.get(cat, cat)
 
             if prefix == "B" or (prefix == "S"):
                 if current:
@@ -234,6 +239,11 @@ class BERTAgent:
             end=span["end"] + offset,
             source="bert",
             confidence=0.95,
+            # Always high — a NER hit on one of these categories is a
+            # direct-identifier finding, not a graded judgment call like the
+            # LLM's quasi-identifier risk. See rule_agent.py's identical
+            # reasoning for why this can't be left at Entity's "low" default.
+            risk="high",
         )
 
     def _merge_fragments(self, text: str, entities: list[Entity]) -> list[Entity]:
@@ -265,6 +275,7 @@ class BERTAgent:
                     end=entity.end,
                     source="bert",
                     confidence=min(prev.confidence, entity.confidence),
+                    risk="high",
                 )
             else:
                 merged.append(entity)
@@ -286,6 +297,7 @@ class BERTAgent:
                 end=entity.end,
                 source=entity.source,
                 confidence=entity.confidence,
+                risk="high",
             )
         return entity
 
@@ -308,6 +320,7 @@ class BERTAgent:
             end=end,
             source=entity.source,
             confidence=entity.confidence,
+            risk=entity.risk,
         )
 
 
