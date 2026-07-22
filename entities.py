@@ -8,7 +8,7 @@ class Entity:
     label: str
     start: int
     end: int
-    source: str                        # "rule", "bert", "llm"
+    source: str                        # "rule", "bert", "llm", "gazetteer", "propagated"
     confidence: float = 1.0
     generalized: Optional[str] = None  # e.g. "45 år" -> "40-50 år"
     risk: str = "low"                  # "low", "medium", "high"

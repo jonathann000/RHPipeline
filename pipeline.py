@@ -88,7 +88,7 @@ LLM backend is swappable via config — see llm_backend.py
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from entities import Entity, build_redaction_plan
 from bert_agent import BERTAgent
@@ -189,7 +189,15 @@ class PIIPipeline:
         # text; every backend's findings are extended into all_entities and
         # reconciled by the same overlap-resolution that already merges
         # rules/BERT/gazetteer entities, in _propagate_and_redact below.
-        scan_text = redact_document(text, all_entities, self.no_generalize) if self.llm_backstop else None
+        # Redact through build_redaction_plan (not all_entities directly) for
+        # the same reason the final redaction does: rules and BERT can flag
+        # overlapping spans (e.g. both tag the same date), and redact_document
+        # replaces in reverse assuming spans never overlap — feeding it the raw,
+        # un-reconciled list would corrupt the very text the backstop LLM reads.
+        scan_text = (
+            redact_document(text, build_redaction_plan(text, all_entities), self.no_generalize)
+            if self.llm_backstop else None
+        )
         for llm in self.llms:
             llm_entities = llm.detect(
                 text,
@@ -315,7 +323,7 @@ class PIIPipeline:
     def _build_audit(self, text: str, entities: list[Entity]) -> list[dict]:
         return [
             {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "original": e.text,
                 "label": e.label,
                 "start": e.start,

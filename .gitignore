@@ -7,11 +7,11 @@ llms/
 __pycache__/
 *.pyc
 
-# Download script (not needed in repo)
-download_llama.py
-
-# Output files
-data/
+# Pipeline output — redacted text, audit logs, reasoning trails, Label Studio
+# tasks. All generated files go under data/out/ (see run.py defaults), which is
+# disposable and regenerated per run. Sample INPUT files live in data/ root and
+# are tracked normally.
+data/out/
 
 # macOS 
 .DS_Store

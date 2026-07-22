@@ -149,10 +149,8 @@ LLM_BACKENDS = {
     },
 }
 
-import os
-
 BASE_CONFIG = {
-    "bert_model_path": os.environ.get("BERT_MODEL_PATH", "./models/ModelBERTF"),
+    "bert_model_path": os.environ.get("BERT_MODEL_PATH", "./models/MBERTHIPAA"),
 }
 
 # A committed repo asset (see wikidata_script.py), not something that needs
@@ -165,11 +163,11 @@ DEFAULT_GAZETTEER_PATH = os.environ.get("GAZETTEER_PATH", "sweden_entities_deid.
 def main():
     parser = argparse.ArgumentParser(description="PHI De-identification Pipeline")
     parser.add_argument("--input",  default="data/notes.txt",  help="Path to input text file")
-    parser.add_argument("--output", default="data/redacted.txt",  help="Path to write redacted text")
-    parser.add_argument("--audit",  default="data/audit.json",  help="Path to write audit log (JSON)")
+    parser.add_argument("--output", default="data/out/redacted.txt",  help="Path to write redacted text")
+    parser.add_argument("--audit",  default="data/out/audit.json",  help="Path to write audit log (JSON)")
     parser.add_argument(
         "--reasoning-output",
-        default="data/reasoning.json",
+        default="data/out/reasoning.json",
         help="Path to write the model's <think> reasoning trail, when --llm-thinking (or a judge's own thinking) produced any (default: data/reasoning.json). Nothing is written if there's no reasoning to save."
     )
     parser.add_argument(
@@ -280,6 +278,12 @@ def main():
 
     result = pipe.run(text)
 
+    # Output paths default to data/out/ (see argparse defaults), which won't
+    # exist on a fresh checkout — create each target's parent directory rather
+    # than crashing on the first open().
+    for path in (args.output, args.audit, args.reasoning_output):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(result.redacted_text)
 
@@ -291,6 +295,7 @@ def main():
             json.dump(result.reasoning_log, f, ensure_ascii=False, indent=2)
 
     if args.label_studio_output:
+        os.makedirs(os.path.dirname(args.label_studio_output) or ".", exist_ok=True)
         write_label_studio_export(
             args.label_studio_output,
             text,

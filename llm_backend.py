@@ -35,6 +35,7 @@ loading it twice.
 
 import json
 import re
+import time
 import logging
 from abc import ABC, abstractmethod
 from entities import Entity, remove_overlapping_entities
@@ -53,6 +54,17 @@ _JUDGE_PLACEHOLDER_LIST = ", ".join(sorted(set(PLACEHOLDERS.values())) + ["[REDA
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+#
+# NOTE ON DUPLICATION: the quasi-only prompts (QUASI_ID_SYSTEM / FEW_SHOT) and
+# the full-detection prompts (FULL_DETECTION_SYSTEM / FEW_SHOT_FULL) overlap
+# heavily on purpose — this is NOT a copy-paste artefact to be factored out.
+# They are two separate tasks (quasi-identifiers only vs. direct + quasi) that
+# happen to share heuristics, and they are kept independent so either can be
+# tuned — reworded, re-weighted, given/removed an example — without perturbing
+# the other's measured detection behavior. The wording, category lists, and
+# per-example headers ("Quasi-identifierare:" vs "Entiteter:") already differ
+# between the two; collapsing them into shared fragments would couple two
+# prompts that are meant to evolve separately.
 
 # Few-shot examples in Swedish clinical context
 FEW_SHOT = """
@@ -393,16 +405,11 @@ def _parse_llm_json(raw: str) -> list[dict]:
         if _is_valid_json(m.group())
     ]
     if objects:
-        logger.warning(
-            f"LLM JSON output was truncated/malformed — salvaged {len(objects)} complete "
-            f"entities. Tail of post-strip raw output (diagnostic — remove once root-caused): "
-            f"{raw[-800:]!r}"
-        )
+        logger.warning(f"LLM JSON output was truncated/malformed — salvaged {len(objects)} complete entities")
+        logger.debug(f"Tail of post-strip raw output: {raw[-800:]!r}")
     else:
-        logger.warning(
-            f"Failed to parse LLM JSON output — raw length: {len(raw)} chars. "
-            f"Tail of post-strip raw output (diagnostic — remove once root-caused): {raw[-800:]!r}"
-        )
+        logger.warning(f"Failed to parse LLM JSON output — raw length: {len(raw)} chars")
+        logger.debug(f"Tail of post-strip raw output: {raw[-800:]!r}")
     return objects
 
 
@@ -596,6 +603,43 @@ class LLMBackend(ABC):
         pass
 
 
+class _ProgressStreamer:
+    """
+    Low-overhead generation-progress indicator — the middle ground between
+    TextStreamer (decodes and prints every single token; real overhead,
+    especially over piped/SSH output, see _generate's stream=False default)
+    and total silence (a long generation call becomes indistinguishable
+    from a hang between the per-chunk log lines in detect(), since nothing
+    prints *during* a single chunk's call).
+
+    Duck-typed to whatever model.generate(streamer=...) expects (.put() per
+    generation step, .end() when done) without inheriting from
+    transformers.generation.streamers.BaseStreamer, so it isn't tied to a
+    particular transformers version's import path.
+
+    Throttled by wall-clock time, not token count — a fixed token interval
+    would print too often on a fast model/short chunk and too rarely on a
+    slow one; time-based stays meaningful either way. Logs a real line
+    (not a \r-overwritten one) so it stays readable if output is piped to
+    a file rather than a live terminal.
+    """
+    def __init__(self, min_interval_seconds: float = 5.0):
+        self._count = 0
+        self._min_interval = min_interval_seconds
+        self._start = time.monotonic()
+        self._last_print = self._start
+
+    def put(self, value):
+        self._count += 1
+        now = time.monotonic()
+        if now - self._last_print >= self._min_interval:
+            logger.info(f"    ...still generating ({self._count} steps, {now - self._start:.0f}s elapsed)")
+            self._last_print = now
+
+    def end(self):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # HuggingFace backend (Llama / Mistral / Qwen / Gemma — all use same interface)
 # ---------------------------------------------------------------------------
@@ -635,8 +679,11 @@ class HuggingFaceLLMBackend(LLMBackend):
             tokenizer=self.tokenizer,
         )
         # Prints generated tokens live to the terminal as they're produced —
-        # otherwise a 30-90s generation call looks like a hang.
+        # real per-token decode+flush overhead, so opt-in only (stream=True)
+        # for verbose local debugging. self.progress_streamer below is the
+        # default: a throttled, no-decode "still working" indicator.
         self.streamer = TextStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        self.progress_streamer = _ProgressStreamer()
 
         # Populated only when enable_thinking is on and the model actually
         # produced a <think> block — see _detect_once/judge. Explainability
@@ -949,22 +996,43 @@ class HuggingFaceLLMBackend(LLMBackend):
         generation_config.json triggers a deprecation warning on every
         single call otherwise.
 
-        stream=False by default: TextStreamer's only purpose is printing
-        tokens live so a 30-90s generation call doesn't look like a hang
-        during interactive local development (see self.streamer's comment)
-        — real, if modest, overhead (incremental decode + stdout flush on
-        every token) for zero benefit on a scripted/server run where
-        nobody's watching the terminal live, and piped/redirected output
-        (a log file, a non-interactive SSH session) can make that overhead
-        considerably worse than on a local interactive tty. Pass
-        stream=True explicitly for local interactive debugging if wanted.
+        stream=False by default: TextStreamer's per-token decode+flush is
+        real, if modest, overhead for zero benefit on a scripted/server run
+        where nobody's watching every token live, and piped/redirected
+        output (a log file, a non-interactive SSH session) can make that
+        overhead considerably worse than on a local interactive tty. Pass
+        stream=True explicitly for verbose local interactive debugging.
+
+        When not streaming full text, self.progress_streamer runs instead
+        of no streamer at all — a throttled, no-decode "still generating"
+        log line (see _ProgressStreamer) so a single chunk's multi-minute
+        call on a large model doesn't look indistinguishable from a hang,
+        without TextStreamer's per-token cost. stream=True's TextStreamer
+        already shows every token, so there's no need for both at once.
         """
         from transformers import GenerationConfig
+
+        # Building a GenerationConfig from scratch, rather than modifying
+        # the model's own loaded one, previously left eos_token_id unset —
+        # defaulting to None instead of inheriting the checkpoint's real
+        # stop token(s). Harmless for a model whose only stop token is the
+        # tokenizer's plain EOS, but Gemma-family chat models rely on
+        # <end_of_turn> as their actual turn-ending token; without it, the
+        # model can finish its real answer and just keep sampling instead
+        # of stopping, since nothing it generates next is recognized as a
+        # valid halt signal — observed directly: a complete, valid JSON
+        # array followed by stray commentary and a second array, on a
+        # chunk that took far longer than the others to generate. Reusing
+        # self.model.generation_config.eos_token_id (loaded from the
+        # checkpoint's own generation_config.json) restores whatever
+        # stop-token(s) that specific model actually defines.
+        eos_token_id = self.model.generation_config.eos_token_id or self.tokenizer.eos_token_id
 
         gen_config = GenerationConfig(
             max_new_tokens=max_new_tokens,
             temperature=0.1,     # low temp for consistent structured output
             do_sample=True,
+            eos_token_id=eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
             # Hard block on repeating an exact 24-token run — guards against
             # the model falling into a degenerate loop re-emitting the same
@@ -978,7 +1046,11 @@ class HuggingFaceLLMBackend(LLMBackend):
             # generation budget).
             no_repeat_ngram_size=24,
         )
-        output = self.pipe(prompt, generation_config=gen_config, streamer=self.streamer if stream else None)
+        output = self.pipe(
+            prompt,
+            generation_config=gen_config,
+            streamer=self.streamer if stream else self.progress_streamer,
+        )
         return output[0]["generated_text"][len(prompt):]
 
 

@@ -11,8 +11,9 @@
 # an ensemble — see run.py's --llm help for backend names (llama, mistral,
 # qwen, qwen-32b, gemma, gemma-27b, gemma4-12b, gemma4-31b).
 #
-# --input/--output/--audit default to data/notes.txt, data/redacted.txt,
-# data/audit.json respectively if not given.
+# --input/--output/--audit default to data/notes.txt, data/out/redacted.txt,
+# data/out/audit.json respectively if not given (generated output lands in
+# data/out/, which is git-ignored — see .gitignore).
 #
 # Expects:
 #   - HF_TOKEN set as environment variable
@@ -26,8 +27,8 @@ export HF_HOME="$(pwd)/.model_cache"
 LLM=("${LLM:-llama}")
 MODE="${MODE:-full}"
 INPUT="data/notes.txt"
-OUTPUT="data/redacted.txt"
-AUDIT="data/audit.json"
+OUTPUT="data/out/redacted.txt"
+AUDIT="data/out/audit.json"
 GAZETTEER=""
 NO_GAZETTEER=""
 NO_GENERALIZE=""
