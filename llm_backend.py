@@ -879,22 +879,44 @@ class HuggingFaceLLMBackend(LLMBackend):
 
         entities = []
         for ent in raw_entities:
-            offsets = _resolve_offsets(text, ent.get("text", ""), claimed_spans)
-            if offsets is None:
-                logger.debug(f"Skipping hallucinated span: {ent.get('text')}")
-                continue
-            claimed_spans.add(offsets)
+            try:
+                offsets = _resolve_offsets(text, ent.get("text", ""), claimed_spans)
+                if offsets is None:
+                    logger.debug(f"Skipping hallucinated span: {ent.get('text')}")
+                    continue
+                claimed_spans.add(offsets)
 
-            entities.append(Entity(
-                text=ent["text"],
-                label=ent.get("label", "unknown"),
-                start=offsets[0],
-                end=offsets[1],
-                source="llm",
-                confidence=0.8,
-                generalized=ent.get("generalize"),
-                risk=ent.get("risk", "medium"),
-            ))
+                generalize = ent.get("generalize")
+                if generalize is not None and not isinstance(generalize, str):
+                    # A schema hallucination, not just a content one — the
+                    # model produced valid JSON but put something other than
+                    # a string (e.g. a nested object) in "generalize".
+                    # Downstream code (redaction.py's _is_non_generalization,
+                    # the Label Studio export's meta text, ...) all assume
+                    # this is either None or str, so treat anything else as
+                    # untrustworthy and fall back to a placeholder — same
+                    # "distrust rather than crash or silently misrender"
+                    # policy used elsewhere in this file.
+                    logger.warning(f"LLM produced non-string 'generalize' ({type(generalize).__name__}): {generalize!r} — discarding it")
+                    generalize = None
+
+                entities.append(Entity(
+                    text=ent["text"],
+                    label=ent.get("label", "unknown"),
+                    start=offsets[0],
+                    end=offsets[1],
+                    source="llm",
+                    confidence=0.8,
+                    generalized=generalize,
+                    risk=ent.get("risk", "medium"),
+                ))
+            except (KeyError, TypeError) as e:
+                # A single malformed entity (missing/wrong-typed field
+                # somewhere we haven't specifically guarded, e.g. an
+                # unhashable "label") shouldn't crash a run that may have
+                # already spent many minutes generating on a large model —
+                # skip just this one entity and keep the rest of the batch.
+                logger.warning(f"Skipping malformed LLM entity ({e!r}): {ent!r}")
 
         return entities
 

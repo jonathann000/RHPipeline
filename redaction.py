@@ -4,7 +4,11 @@ Applies entity redactions to text, preferring generalization over blanking.
 Processes spans in reverse order to preserve character offsets.
 """
 
+import logging
+
 from entities import Entity, ALWAYS_DIRECT_LABELS, NEVER_REDACT_LABELS
+
+logger = logging.getLogger(__name__)
 
 # Fallback placeholders when no generalization is available
 PLACEHOLDERS = {
@@ -48,10 +52,23 @@ def resolve_replacement(entity: Entity, no_generalize: bool = False) -> str:
         just costs the document some of the informativeness a correct
         generalization would have kept.
     """
+    if not isinstance(entity.label, str):
+        # A schema hallucination from an upstream producer (seen in
+        # practice: an LLM emitting something other than a string for a
+        # JSON field) — every lookup below (dict/set membership) would
+        # raise on an unhashable label like a dict. llm_backend.py already
+        # guards its own construction path, but Entity is a shared
+        # dataclass any module could build, so this is checked again here
+        # at the actual point of use rather than trusting every producer.
+        logger.warning(f"Entity has non-string label ({type(entity.label).__name__}): {entity.label!r} — using generic placeholder")
+        return "[REDAKTERAD]"
     if entity.label in NEVER_REDACT_LABELS:
         return entity.text  # tracked in the audit trail, left verbatim in the document
     if (
         not no_generalize
+        and isinstance(entity.generalized, str)  # not just truthy — a non-string
+                                                  # (e.g. a dict) would crash
+                                                  # _is_non_generalization's .strip()
         and entity.generalized
         and entity.label in PLACEHOLDERS  # only trust generalize for a label we recognize —
                                            # an unrecognized/hallucinated label (e.g. a model
