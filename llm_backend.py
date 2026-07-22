@@ -393,9 +393,16 @@ def _parse_llm_json(raw: str) -> list[dict]:
         if _is_valid_json(m.group())
     ]
     if objects:
-        logger.warning(f"LLM JSON output was truncated/malformed — salvaged {len(objects)} complete entities")
+        logger.warning(
+            f"LLM JSON output was truncated/malformed — salvaged {len(objects)} complete "
+            f"entities. Tail of post-strip raw output (diagnostic — remove once root-caused): "
+            f"{raw[-800:]!r}"
+        )
     else:
-        logger.warning(f"Failed to parse LLM JSON output — raw length: {len(raw)} chars")
+        logger.warning(
+            f"Failed to parse LLM JSON output — raw length: {len(raw)} chars. "
+            f"Tail of post-strip raw output (diagnostic — remove once root-caused): {raw[-800:]!r}"
+        )
     return objects
 
 
@@ -757,7 +764,17 @@ class HuggingFaceLLMBackend(LLMBackend):
         if not target_quotes and not detect_direct and len(scanned_text) > _QUASI_CHUNK_CHARS:
             claimed_spans: set[tuple[int, int]] = set()
             entities = []
-            for start, end in chunk_by_sentences(scanned_text, _QUASI_CHUNK_CHARS):
+            chunks = list(chunk_by_sentences(scanned_text, _QUASI_CHUNK_CHARS))
+            for i, (start, end) in enumerate(chunks, 1):
+                # Each chunk is its own full generation call — can easily
+                # run tens of seconds to minutes on a large model, with
+                # nothing printed while it's in progress (see _generate's
+                # stream=False default). Without this, a multi-chunk
+                # document looks indistinguishable from a genuine hang
+                # between chunks — this is the cheap, coarse-grained
+                # alternative to per-token streaming: no meaningful
+                # overhead, but confirms forward progress.
+                logger.info(f"LLM chunk {i}/{len(chunks)} ({end - start} chars) — starting generation...")
                 entities.extend(self._detect_once(
                     text, scanned_text[start:end], existing, detect_direct,
                     enable_thinking, target_quotes=None, claimed_spans=claimed_spans,
