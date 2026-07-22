@@ -335,15 +335,32 @@ Bedömning:
 [{"quote": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "reason": "ovanligt specifikt yrke och arbetsplats för en anhörig kan indirekt identifiera patienten"}]
 """
 
+# Two distinct reasoning-block delimiter conventions seen in practice:
+# Qwen3 wraps it in <think>...</think>; Gemma 4 opens a channel with
+# <|channel>thought and closes it with <channel|> (confirmed directly
+# against google/gemma-4-12B-it's own chat template — it inserts this
+# unconditionally, even when enable_thinking=False is passed). Each
+# backend uses one or the other, never both, but there's no cheap way to
+# know which ahead of a given raw response, so both patterns are always
+# checked.
+_THINKING_BLOCK_PATTERNS = [
+    r"<think>(.*?)</think>",
+    r"<\|channel>thought(.*?)<channel\|>",
+]
+
+
 def _extract_thinking(raw: str) -> str | None:
     """
-    Pull out a <think>...</think> reasoning block's content, if present —
-    call this before _parse_llm_json, which strips the same block to get
-    at the JSON payload. Used to persist the model's reasoning for
-    explainability rather than just discarding it once parsing is done.
+    Pull out a reasoning block's content, if present — call this before
+    _parse_llm_json, which strips the same block to get at the JSON
+    payload. Used to persist the model's reasoning for explainability
+    rather than just discarding it once parsing is done.
     """
-    match = re.search(r"<think>(.*?)</think>", raw, flags=re.DOTALL)
-    return match.group(1).strip() if match else None
+    for pattern in _THINKING_BLOCK_PATTERNS:
+        match = re.search(pattern, raw, flags=re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    return None
 
 
 def _parse_llm_json(raw: str) -> list[dict]:
@@ -353,10 +370,14 @@ def _parse_llm_json(raw: str) -> list[dict]:
     array off mid-entity — salvage whichever top-level objects are individually
     complete rather than discarding the whole batch.
     """
-    # Strip a reasoning block (e.g. Qwen3's <think>...</think>) and markdown
-    # fences before looking for the entity array, so stray brackets in the
-    # model's reasoning text don't get mistaken for the JSON payload.
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    # Strip a reasoning block (see _THINKING_BLOCK_PATTERNS — Qwen3's
+    # <think>...</think>, or Gemma 4's <|channel>thought...<channel|>) and
+    # markdown fences before looking for the entity array, so stray
+    # brackets in the model's own reasoning text (e.g. describing the JSON
+    # shape it's about to produce) don't get mistaken for the JSON payload
+    # itself, or corrupt the brace-matching salvage fallback below.
+    for pattern in _THINKING_BLOCK_PATTERNS:
+        raw = re.sub(pattern, "", raw, flags=re.DOTALL)
     raw = re.sub(r"```json|```", "", raw).strip()
 
     match = re.search(r"\[.*\]", raw, re.DOTALL)
@@ -804,23 +825,28 @@ class HuggingFaceLLMBackend(LLMBackend):
             input_tokens = len(self.tokenizer.encode(scanned_text))
             max_new_tokens = max(2048, input_tokens * 2) if detect_direct else max(512, input_tokens)
 
-        if enable_thinking:
-            # A <think> block consumes real generation budget before the
-            # answer even starts, on top of whatever the answer itself
-            # needs — this used to be a flat 4096 *replacing* the length-
-            # scaled budget above, which silently starved longer documents:
-            # a ~5000-token document left a Qwen3-32B thinking run with
-            # only 5 entities, versus a dozen from a non-thinking run on
-            # the same document, because most of the 4096 went to
-            # reasoning before the JSON answer even started. Add headroom
-            # on top of the base budget instead of replacing it, scaled by
-            # input length for the same reason the base budget is — a
-            # longer document needs more room to reason about, not just a
-            # flat allowance sized for whatever document this was last
-            # tuned against.
-            if input_tokens is None:
-                input_tokens = len(self.tokenizer.encode(scanned_text))
-            max_new_tokens += max(4096, input_tokens * 2)
+        # A reasoning block consumes real generation budget before the
+        # answer even starts, on top of whatever the answer itself needs —
+        # this used to be gated on our own enable_thinking flag, which
+        # silently starved longer documents whenever a model reasons
+        # regardless of what we asked for: Gemma 4's chat template opens a
+        # "thought" channel unconditionally (confirmed directly — it's
+        # still there with enable_thinking=False passed), unlike Qwen3
+        # where the kwarg genuinely toggles it. A model that reasoned
+        # anyway with no headroom budgeted for it ran out of tokens mid
+        # JSON array on a real document (see llm_backend:_parse_llm_json's
+        # salvage warning). Applying this unconditionally, not just when
+        # enable_thinking=True, costs nothing for a model that doesn't
+        # reason by default — it still stops early via EOS once actually
+        # done, so a generous ceiling it never needs is free; it just also
+        # correctly covers a model that reasons whether we ask it to or
+        # not. Same headroom sizing as before: scaled by input length for
+        # the same reason the base budget is — a longer document needs
+        # more room to reason about, not a flat allowance sized for
+        # whatever document this was last tuned against.
+        if input_tokens is None:
+            input_tokens = len(self.tokenizer.encode(scanned_text))
+        max_new_tokens += max(4096, input_tokens * 2)
 
         generated = self._generate(prompt, max_new_tokens)
         if enable_thinking:
@@ -859,17 +885,13 @@ class HuggingFaceLLMBackend(LLMBackend):
         user_msg = f"{JUDGE_FEW_SHOT}\nText: \"{redacted_text}\"\nBedömning:"
         prompt = self._apply_chat_template(JUDGE_SYSTEM, user_msg, enable_thinking)
 
+        # Same rationale as _detect_once: applied unconditionally, not just
+        # when enable_thinking=True, since some models (Gemma 4) reason
+        # regardless of what we ask — see the long comment there.
         max_new_tokens = 512
-        if enable_thinking:
-            # Same rationale as detect(): reasoning needs headroom on top
-            # of the answer budget, scaled by input length rather than a
-            # flat allowance that starves a long document's <think> block.
-            input_tokens = len(self.tokenizer.encode(redacted_text))
-            max_new_tokens += max(4096, input_tokens * 2)
-        # No live stream here: JudgePanel always prints a clean post-filter
-        # summary of what actually survives, so streaming the raw unfiltered
-        # verdict first would just show everything twice.
-        generated = self._generate(prompt, max_new_tokens, stream=False)
+        input_tokens = len(self.tokenizer.encode(redacted_text))
+        max_new_tokens += max(4096, input_tokens * 2)
+        generated = self._generate(prompt, max_new_tokens)
         if enable_thinking:
             reasoning = _extract_thinking(generated)
             if reasoning:
@@ -881,12 +903,22 @@ class HuggingFaceLLMBackend(LLMBackend):
                 })
         return _parse_llm_json(generated)
 
-    def _generate(self, prompt: str, max_new_tokens: int, stream: bool = True) -> str:
+    def _generate(self, prompt: str, max_new_tokens: int, stream: bool = False) -> str:
         """
         Run generation via an explicit GenerationConfig — passing loose
         max_new_tokens/temperature/... kwargs alongside the model's own
         generation_config.json triggers a deprecation warning on every
         single call otherwise.
+
+        stream=False by default: TextStreamer's only purpose is printing
+        tokens live so a 30-90s generation call doesn't look like a hang
+        during interactive local development (see self.streamer's comment)
+        — real, if modest, overhead (incremental decode + stdout flush on
+        every token) for zero benefit on a scripted/server run where
+        nobody's watching the terminal live, and piped/redirected output
+        (a log file, a non-interactive SSH session) can make that overhead
+        considerably worse than on a local interactive tty. Pass
+        stream=True explicitly for local interactive debugging if wanted.
         """
         from transformers import GenerationConfig
 
