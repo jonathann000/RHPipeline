@@ -3,21 +3,28 @@
 #
 # Usage:
 #   bash eval_synthetic.sh [pipeline flags...]
+#   RUN_LABEL=<name> bash eval_synthetic.sh [pipeline flags...]
 # e.g.
-#   bash eval_synthetic.sh --llm mistral --mode full
+#   RUN_LABEL=qwen32b  bash eval_synthetic.sh --llm qwen-32b --mode full
+#   RUN_LABEL=mistral  bash eval_synthetic.sh --llm mistral  --mode full
 #   bash eval_synthetic.sh --llm mistral qwen --judges qwen        # ensemble + judge
+#
+# RUN_LABEL namespaces the output directory (data/out/<label>/) so runs from
+# different models don't overwrite each other — set one per model, then compare
+# them with:  python score.py --compare data/out/qwen32b data/out/mistral
 #
 # Any flags you pass are forwarded to run_cluster.sh (--llm, --mode, --judges,
 # --llm-backstop, ...). Do NOT pass --input/--output/--audit — this script sets
 # those per note so the scorer can find the results by name.
 #
-# Outputs land in data/out/<stem>.redacted.txt and <stem>.audit.json, then
+# Outputs land in <out>/<stem>.redacted.txt and <stem>.audit.json, then
 # score.py compares them against data/synthetic_notes_key.json.
 
 set -e
 
 KEY="data/synthetic_notes_key.json"
-OUT="data/out"
+# RUN_LABEL (optional) puts this run in its own subdir so models don't clobber.
+OUT="data/out${RUN_LABEL:+/$RUN_LABEL}"
 LS_TASKS="$OUT/label_studio_tasks.json"
 mkdir -p "$OUT"
 

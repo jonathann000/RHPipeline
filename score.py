@@ -116,6 +116,34 @@ def pct(n: int, d: int) -> str:
     return f"{100 * n / d:5.1f}%" if d else "   n/a"
 
 
+def score_dir(key: dict, note_names: list, runs_dir: str, warn: bool = True) -> list:
+    """Score every note whose <stem>.redacted.txt + <stem>.audit.json exist in runs_dir.
+    Returns a list of (note_name, per_note_result)."""
+    results = []
+    for n in note_names:
+        stem = n[:-4] if n.endswith(".txt") else n
+        red = os.path.join(runs_dir, f"{stem}.redacted.txt")
+        aud = os.path.join(runs_dir, f"{stem}.audit.json")
+        if os.path.exists(red) and os.path.exists(aud):
+            redacted = open(red, encoding="utf-8").read()
+            audit = json.load(open(aud, encoding="utf-8"))
+            results.append((n, score_note(key[n], audit, redacted)))
+        elif warn:
+            print(f"(skipping {n}: expected {stem}.redacted.txt + {stem}.audit.json in {runs_dir})")
+    return results
+
+
+def aggregate_of(results: list) -> dict:
+    """Sum per-note results into overall [hit, total] pairs per metric."""
+    agg = {"direct": [0, 0], "quasi": [0, 0], "decoys": [0, 0], "meds": [0, 0]}
+    for _, r in results:
+        agg["direct"][0] += r["direct"]["removed"];   agg["direct"][1] += r["direct"]["total"]
+        agg["quasi"][0]  += r["quasi"]["removed"];    agg["quasi"][1]  += r["quasi"]["total"]
+        agg["decoys"][0] += r["decoys"]["preserved"]; agg["decoys"][1] += r["decoys"]["total"]
+        agg["meds"][0]   += r["meds"]["ok"];          agg["meds"][1]   += r["meds"]["total"]
+    return agg
+
+
 def main():
     ap = argparse.ArgumentParser(description="Score a pipeline run against the synthetic gold key.")
     ap.add_argument("--key", default="data/synthetic_notes_key.json")
@@ -124,59 +152,66 @@ def main():
     ap.add_argument("--redacted", help="Single-note mode: path to that note's redacted.txt")
     ap.add_argument("--audit", help="Single-note mode: path to that note's audit.json")
     ap.add_argument("--verbose", action="store_true", help="List every miss / over-redaction")
+    ap.add_argument("--compare", nargs="+", metavar="RUNS_DIR",
+                    help="Compare several run directories side by side (label = each dir's basename)")
     args = ap.parse_args()
 
     key = json.load(open(args.key, encoding="utf-8"))
     note_names = [n for n in key if not n.startswith("_")]
 
-    # Resolve which (note -> redacted_path, audit_path) pairs to score.
-    jobs = []
+    legend = ("\nLegend: direct/quasi-recall = fraction of expected identifiers actually "
+              "removed from the output. decoy-keep = fraction of decoys left intact "
+              "(precision proxy). med-ok = medications both flagged in the audit AND kept verbatim.")
+
+    # --- Comparison mode: one aggregate row per run directory ---------------
+    if args.compare:
+        header = f"{'model / run':22} {'direct-recall':>13} {'quasi-recall':>13} {'decoy-keep':>11} {'med-ok':>8}"
+        print(header)
+        print("-" * len(header))
+        for runs_dir in args.compare:
+            results = score_dir(key, note_names, runs_dir, warn=False)
+            label = os.path.basename(os.path.normpath(runs_dir)) or runs_dir
+            if not results:
+                print(f"{label:22}  (no scorable outputs found in {runs_dir})")
+                continue
+            a = aggregate_of(results)
+            print(f"{label:22} "
+                  f"{pct(*a['direct'])} ({a['direct'][0]:2}/{a['direct'][1]:<2}) "
+                  f"{pct(*a['quasi'])} ({a['quasi'][0]:2}/{a['quasi'][1]:<2}) "
+                  f"{pct(*a['decoys'])} "
+                  f"{pct(*a['meds'])}")
+        print(legend)
+        return
+
+    # --- Single-note mode ----------------------------------------------------
     if args.note:
         if not (args.redacted and args.audit):
             ap.error("--note requires --redacted and --audit")
-        jobs.append((args.note, args.redacted, args.audit))
+        redacted = open(args.redacted, encoding="utf-8").read()
+        audit = json.load(open(args.audit, encoding="utf-8"))
+        results = [(args.note, score_note(key[args.note], audit, redacted))]
     elif args.runs_dir:
-        for n in note_names:
-            stem = n[:-4] if n.endswith(".txt") else n
-            red = os.path.join(args.runs_dir, f"{stem}.redacted.txt")
-            aud = os.path.join(args.runs_dir, f"{stem}.audit.json")
-            if os.path.exists(red) and os.path.exists(aud):
-                jobs.append((n, red, aud))
-            else:
-                print(f"(skipping {n}: expected {stem}.redacted.txt + {stem}.audit.json in {args.runs_dir})")
+        results = score_dir(key, note_names, args.runs_dir)
     else:
-        ap.error("provide either --runs-dir (batch) or --note/--redacted/--audit (single)")
+        ap.error("provide --runs-dir (batch), --compare (multi-run), or --note/--redacted/--audit (single)")
 
-    if not jobs:
+    if not results:
         print("Nothing to score — no matching output files found.")
         return
 
+    # --- Per-note table ------------------------------------------------------
     header = f"{'note':22} {'direct-recall':>13} {'quasi-recall':>13} {'decoy-keep':>11} {'med-ok':>8}"
     print(header)
     print("-" * len(header))
 
-    agg = {"direct": [0, 0], "quasi": [0, 0], "decoys": [0, 0], "meds": [0, 0]}
-    all_misses = []
-
-    for note, red_path, aud_path in jobs:
-        redacted = open(red_path, encoding="utf-8").read()
-        audit = json.load(open(aud_path, encoding="utf-8"))
-        r = score_note(key[note], audit, redacted)
-
-        agg["direct"][0] += r["direct"]["removed"];  agg["direct"][1] += r["direct"]["total"]
-        agg["quasi"][0]  += r["quasi"]["removed"];   agg["quasi"][1]  += r["quasi"]["total"]
-        agg["decoys"][0] += r["decoys"]["preserved"]; agg["decoys"][1] += r["decoys"]["total"]
-        agg["meds"][0]   += r["meds"]["ok"];          agg["meds"][1]   += r["meds"]["total"]
-
+    for note, r in results:
         print(f"{note:22} "
               f"{pct(r['direct']['removed'], r['direct']['total'])} ({r['direct']['removed']:2}/{r['direct']['total']:<2}) "
               f"{pct(r['quasi']['removed'], r['quasi']['total'])} ({r['quasi']['removed']:2}/{r['quasi']['total']:<2}) "
               f"{pct(r['decoys']['preserved'], r['decoys']['total'])} "
               f"{pct(r['meds']['ok'], r['meds']['total'])}")
 
-        if args.verbose:
-            all_misses.append((note, r))
-
+    agg = aggregate_of(results)
     print("-" * len(header))
     print(f"{'TOTAL':22} "
           f"{pct(*agg['direct'])} ({agg['direct'][0]}/{agg['direct'][1]}) "
@@ -184,12 +219,10 @@ def main():
           f"{pct(*agg['decoys'])} "
           f"{pct(*agg['meds'])}")
 
-    print("\nLegend: direct/quasi-recall = fraction of expected identifiers actually "
-          "removed from the output. decoy-keep = fraction of decoys left intact "
-          "(precision proxy). med-ok = medications both flagged in the audit AND kept verbatim.")
+    print(legend)
 
     if args.verbose:
-        for note, r in all_misses:
+        for note, r in results:
             lines = []
             for kind in ("direct", "quasi"):
                 for m in r[kind]["misses"]:
