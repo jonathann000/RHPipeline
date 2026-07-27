@@ -1,0 +1,163 @@
+{
+  "_about": {
+    "purpose": "Gold-standard evaluation key for the synthetic test notes. Use it to score recall (did the pipeline produce a span covering each expected item?) and precision (did it avoid flagging the decoys?).",
+    "matching": "Entities are keyed on surface text + label rather than character offsets, so match a pipeline finding to a key item when the key's 'text' is contained in (or equal to) the finding's original text and the labels agree. Offsets are intentionally omitted — they are brittle to hand-maintain and the pipeline's own overlap resolution can split/extend spans.",
+    "labels": "Taxonomy matches the pipeline (see redaction.py PLACEHOLDERS / entities.py). Direct identifiers: private_person, private_email, private_phone, account_number, private_address, private_date, secret. Quasi-identifiers: demographics, medical, temporal, social, and private_address when used for a place. medication is flagged for the audit trail but deliberately left verbatim in the output (NEVER_REDACT_LABELS).",
+    "buckets": {
+      "should_redact": "Must be detected AND replaced (placeholder or generalization). Missing any of these is a recall failure — the costly error.",
+      "medications_flag_keep": "Should be detected and logged with label 'medication' but LEFT VERBATIM in the redacted text (generalize=null).",
+      "should_not_flag": "Decoys — normal vitals, common conditions, common findings. Flagging/redacting these is a precision failure (over-redaction)."
+    },
+    "caveats": [
+      "Risk levels (low/medium/high) and the exact boundary of a quasi-identifier phrase are judgment calls; treat them as guidance, not absolutes. Score span coverage and label first, risk second.",
+      "Disease-specific medications (e.g. Riluzol/Tetrabenazin for ALS/Huntington, Dornase alfa for cystic fibrosis) are a known tension: the pipeline keeps medication names verbatim, yet they can leak the very rare diagnosis that is separately redacted. Worth measuring/discussing separately rather than scoring as a plain miss.",
+      "Place names span a spectrum: a hospital/street/zip is a direct locator, while a small municipality (Pajala, Sorsele, Ronneby) is primarily a quasi-identifier because it narrows the population. Both are labeled private_address here."
+    ]
+  },
+
+  "synthetic_note.txt": {
+    "should_redact": [
+      {"text": "720613-5518", "label": "account_number", "type": "direct"},
+      {"text": "Karin Bergström", "label": "private_person", "type": "direct"},
+      {"text": "Dr. Mikael Holm", "label": "private_person", "type": "direct"},
+      {"text": "Anders Bergström", "label": "private_person", "type": "direct"},
+      {"text": "2024-03-10", "label": "private_date", "type": "direct"},
+      {"text": "2024-03-22", "label": "private_date", "type": "direct"},
+      {"text": "2024-03-11", "label": "private_date", "type": "direct"},
+      {"text": "2024-03-14", "label": "private_date", "type": "direct"},
+      {"text": "2024-03-19", "label": "private_date", "type": "direct"},
+      {"text": "Akademiska sjukhuset", "label": "private_address", "type": "direct"},
+      {"text": "Kungsgatan 12", "label": "private_address", "type": "direct"},
+      {"text": "754 50 Uppsala", "label": "private_address", "type": "direct"},
+      {"text": "Uppsala", "label": "private_address", "type": "direct"},
+      {"text": "073-456 78 90", "label": "private_phone", "type": "direct"},
+      {"text": "018-611 22 33", "label": "private_phone", "type": "direct"},
+      {"text": "karin.bergstrom@example.se", "label": "private_email", "type": "direct"},
+      {"text": "52-årig kvinna", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "gymnasielärare i Enköping", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "Enköping", "label": "private_address", "risk": "high", "type": "quasi"},
+      {"text": "två vuxna barn", "label": "demographics", "risk": "low", "type": "quasi"},
+      {"text": "Amyotrofisk lateralskleros (ALS)", "label": "medical", "risk": "high", "type": "quasi"},
+      {"text": "en välkänd hjärtkirurg vid Akademiska sjukhuset", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "en av mycket få praktiserande buddhister i kommunen", "label": "social", "risk": "high", "type": "quasi"}
+    ],
+    "medications_flag_keep": ["Metoprolol", "Omeprazol", "Riluzol", "Paracetamol", "Amoxicillin", "Penicillin"],
+    "should_not_flag": ["138/85", "96 slag per minut", "lindrig astma", "blindtarmsinflammation", "pneumoni", "Samhällsförvärvad pneumoni", "rökfri sedan 15 år"]
+  },
+
+  "synthetic_note2.txt": {
+    "should_redact": [
+      {"text": "580921-3412", "label": "account_number", "type": "direct"},
+      {"text": "Bengt-Åke Nordin", "label": "private_person", "type": "direct"},
+      {"text": "Dr. Sofia Lindqvist", "label": "private_person", "type": "direct"},
+      {"text": "Margareta Nordin", "label": "private_person", "type": "direct"},
+      {"text": "Norrlands universitetssjukhus", "label": "private_address", "type": "direct"},
+      {"text": "Umeå", "label": "private_address", "type": "direct"},
+      {"text": "2024-06-02", "label": "private_date", "type": "direct"},
+      {"text": "2024-06-11", "label": "private_date", "type": "direct"},
+      {"text": "2024-06-03", "label": "private_date", "type": "direct"},
+      {"text": "Lappmarksvägen 7", "label": "private_address", "type": "direct"},
+      {"text": "984 31 Pajala", "label": "private_address", "type": "direct"},
+      {"text": "070-812 44 91", "label": "private_phone", "type": "direct"},
+      {"text": "090-785 11 20", "label": "private_phone", "type": "direct"},
+      {"text": "bengt.nordin@example.se", "label": "private_email", "type": "direct"},
+      {"text": "66-årig man", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "kommunens enda renskötare med egen sameby", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "Pajala", "label": "private_address", "risk": "high", "type": "quasi"},
+      {"text": "tre vuxna barn", "label": "demographics", "risk": "low", "type": "quasi"},
+      {"text": "tornedalska minoriteten", "label": "demographics", "risk": "high", "type": "quasi"},
+      {"text": "talar meänkieli", "label": "demographics", "risk": "high", "type": "quasi"},
+      {"text": "Huntingtons sjukdom", "label": "medical", "risk": "high", "type": "quasi"},
+      {"text": "sitter i kommunfullmäktige och är en välkänd lokalpolitiker", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "Fadern avled i Huntingtons sjukdom", "label": "medical", "risk": "medium", "type": "quasi"}
+    ],
+    "medications_flag_keep": ["Metformin", "Enalapril", "Tetrabenazin", "Paracetamol"],
+    "should_not_flag": ["134/82", "78 slag per minut", "37,1 grader", "Typ 2-diabetes", "essentiell hypertoni"]
+  },
+
+  "synthetic_note3.txt": {
+    "should_redact": [
+      {"text": "431105-2287", "label": "account_number", "type": "direct"},
+      {"text": "Astrid Lindgren Sundqvist", "label": "private_person", "type": "direct"},
+      {"text": "Dr. Johan Persson", "label": "private_person", "type": "direct"},
+      {"text": "Skånes universitetssjukhus", "label": "private_address", "type": "direct"},
+      {"text": "Lund", "label": "private_address", "type": "direct"},
+      {"text": "2024-01-18", "label": "private_date", "type": "direct"},
+      {"text": "2024-02-02", "label": "private_date", "type": "direct"},
+      {"text": "2024-01-20", "label": "private_date", "type": "direct"},
+      {"text": "Vindelvägen 3", "label": "private_address", "type": "direct"},
+      {"text": "924 31 Sorsele", "label": "private_address", "type": "direct"},
+      {"text": "073-221 09 55", "label": "private_phone", "type": "direct"},
+      {"text": "046-172 33 40", "label": "private_phone", "type": "direct"},
+      {"text": "astrid.sundqvist@example.com", "label": "private_email", "type": "direct"},
+      {"text": "80-årig kvinna", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "Sorsele", "label": "private_address", "risk": "high", "type": "quasi"},
+      {"text": "Änka", "label": "demographics", "risk": "low", "type": "quasi"},
+      {"text": "samisk hantverkare", "label": "demographics", "risk": "high", "type": "quasi"},
+      {"text": "sålde duodji", "label": "social", "risk": "medium", "type": "quasi"},
+      {"text": "Creutzfeldt-Jakobs sjukdom", "label": "medical", "risk": "high", "type": "quasi"},
+      {"text": "son är ortens enda verksamma veterinär", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "aktiv i den lokala lästadianska församlingen", "label": "social", "risk": "high", "type": "quasi"}
+    ],
+    "medications_flag_keep": ["Levotyroxin", "Kalciumkarbonat", "Paracetamol", "Morfin", "Midazolam", "Sulfa"],
+    "should_not_flag": ["142/88", "82 slag per minut", "Hypotyreos", "Katarraktoperation"]
+  },
+
+  "synthetic_note4.txt": {
+    "should_redact": [
+      {"text": "990412-6690", "label": "account_number", "type": "direct"},
+      {"text": "Elias Cohen", "label": "private_person", "type": "direct"},
+      {"text": "Dr. Petra Ekström", "label": "private_person", "type": "direct"},
+      {"text": "Visby lasarett", "label": "private_address", "type": "direct"},
+      {"text": "Gotland", "label": "private_address", "type": "direct"},
+      {"text": "2024-09-05", "label": "private_date", "type": "direct"},
+      {"text": "2024-09-09", "label": "private_date", "type": "direct"},
+      {"text": "Adelsgatan 21", "label": "private_address", "type": "direct"},
+      {"text": "621 57 Visby", "label": "private_address", "type": "direct"},
+      {"text": "Visby", "label": "private_address", "type": "direct"},
+      {"text": "072-990 15 03", "label": "private_phone", "type": "direct"},
+      {"text": "0498-268 000", "label": "private_phone", "type": "direct"},
+      {"text": "elias.cohen@example.se", "label": "private_email", "type": "direct"},
+      {"text": "25-årig man", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "landslagsaktiv orienterare", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "Cystisk fibros", "label": "medical", "risk": "high", "type": "quasi"},
+      {"text": "en av få praktiserande medlemmar i Visbys lilla judiska församling", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "far är öns enda verksamma domprost", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "tränare för ett ungdomslag i orientering", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "syster är också bärare av cystisk fibros", "label": "medical", "risk": "medium", "type": "quasi"}
+    ],
+    "medications_flag_keep": ["Dornase alfa", "Pankreasenzymer", "Ibuprofen", "Ciprofloxacin"],
+    "should_not_flag": ["118/72", "64 slag per minut", "96 procent", "kronisk bihåleinflammation", "Pseudomonas aeruginosa"]
+  },
+
+  "synthetic_note5.txt": {
+    "should_redact": [
+      {"text": "671230-4471", "label": "account_number", "type": "direct"},
+      {"text": "Birgitta Öhman", "label": "private_person", "type": "direct"},
+      {"text": "Dr. Anders Ryberg", "label": "private_person", "type": "direct"},
+      {"text": "Sven Öhman", "label": "private_person", "type": "direct"},
+      {"text": "Blekingesjukhuset", "label": "private_address", "type": "direct"},
+      {"text": "Karlskrona", "label": "private_address", "type": "direct"},
+      {"text": "2024-11-12", "label": "private_date", "type": "direct"},
+      {"text": "2024-11-28", "label": "private_date", "type": "direct"},
+      {"text": "2024-11-13", "label": "private_date", "type": "direct"},
+      {"text": "2024-11-18", "label": "private_date", "type": "direct"},
+      {"text": "2024-11-22", "label": "private_date", "type": "direct"},
+      {"text": "Karlshamnsvägen 44", "label": "private_address", "type": "direct"},
+      {"text": "372 37 Ronneby", "label": "private_address", "type": "direct"},
+      {"text": "076-303 88 21", "label": "private_phone", "type": "direct"},
+      {"text": "0455-73 10 00", "label": "private_phone", "type": "direct"},
+      {"text": "birgitta.ohman@example.com", "label": "private_email", "type": "direct"},
+      {"text": "56-årig kvinna", "label": "demographics", "risk": "medium", "type": "quasi"},
+      {"text": "Ronneby", "label": "private_address", "risk": "high", "type": "quasi"},
+      {"text": "regionens första kvinnliga domkyrkoorganist", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "Binjurebarkscancer", "label": "medical", "risk": "high", "type": "quasi"},
+      {"text": "en internationellt uppmärksammad glaskonstnär med egen ateljé", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "en vuxen dotter bosatt utomlands", "label": "demographics", "risk": "low", "type": "quasi"},
+      {"text": "djupt engagerad i Svenska kyrkan och leder ortens enda gosskör", "label": "social", "risk": "high", "type": "quasi"},
+      {"text": "Modern hade bröstcancer", "label": "medical", "risk": "low", "type": "quasi"}
+    ],
+    "medications_flag_keep": ["Sertralin", "Amlodipin", "Paracetamol", "Hydrokortison", "Jodkontrast"],
+    "should_not_flag": ["176/104", "92 slag per minut", "Depression", "Gallstensbesvär"]
+  }
+}
