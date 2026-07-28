@@ -255,6 +255,27 @@ läkemedelsnamn avslöjar inte i sig vem patienten är, till skillnad från en
 sällsynt diagnos (label: medical), som fortfarande ska generaliseras.
 """
 
+# Detection-only mode: used when a separate GeneralizeAgent will propose the
+# generalizations (see generalize_agent.py + pipeline Stage 3.5), so the
+# detection LLM does ONE job — find text/label/risk — and never spends effort
+# on a generalization that would just be overwritten. Derived from the existing
+# few-shots (same examples, only the "generalize" field dropped) rather than
+# duplicated, so detection behavior is otherwise identical.
+def _strip_generalize(few_shot: str) -> str:
+    return re.sub(r',\s*"generalize":\s*(?:"[^"]*"|null)', "", few_shot)
+
+
+FEW_SHOT_NOGEN = _strip_generalize(FEW_SHOT)
+FEW_SHOT_FULL_NOGEN = _strip_generalize(FEW_SHOT_FULL)
+
+# Appended to the detection task line so the model returns only text/label/risk
+# and leaves generalization entirely to the separate agent.
+_OMIT_GENERALIZE_INSTRUCTION = (
+    " Föreslå INGEN generalisering — utelämna fältet \"generalize\" helt och "
+    "returnera endast \"text\", \"label\" och \"risk\" för varje entitet."
+)
+
+
 # Used for the judge retry pass — classifying specific already-flagged
 # excerpts, NOT scanning for new ones. Deliberately its own prompt rather
 # than reusing FULL_DETECTION_SYSTEM: that system prompt's whole framing
@@ -300,6 +321,39 @@ Text (sammanhang): "Bor tillsammans med sin make, Dr. Nilsson, en framstående b
 Entiteter:
 [
   {"text": "en framstående barnneurolog vid Sahlgrenska Universitetssjukhuset", "label": "social", "risk": "high", "generalize": "make med specialiserat läkaryrke vid större sjukhus"}
+]
+"""
+
+# Used by the separate GeneralizeAgent stage (see generalize_agent.py) — a
+# different task from detection: the spans are ALREADY found and classified;
+# this only proposes an abstraction for each. Kept independent of the detection
+# prompts so generalization quality can be tuned/measured on its own, and so a
+# different (e.g. stronger) backend can generalize than the one that detected.
+GENERALIZE_SYSTEM = """Du är ett system som föreslår generaliseringar för redan identifierade quasi-identifierare i svenska journalanteckningar.
+Du får dokumentet som sammanhang och en numrerad lista med exakta textutdrag som redan klassificerats som quasi-identifierare, med sin kategori. Du letar INTE efter nya uppgifter.
+
+För VARJE utdrag: föreslå en generalisering som tar bort den identifierande specificiteten men bevarar så mycket kliniskt/analytiskt värde som möjligt. Generaliseringen får INTE innehålla den ursprungliga texten (eller en del av den) — den ska abstrahera, inte bara upprepa eller lägga till ord. En sällsynt diagnos ska bli en bredare sjukdomsklass, ett ovanligt yrke en bredare yrkeskategori, en specifik ort en vagare geografisk beskrivning, en exakt ålder ett åldersspann.
+
+Returnera ENBART giltig JSON — en lista med exakt ett objekt per utdrag, i samma ordning och med samma nummer:
+[{"index": 1, "generalize": "..."}]
+"""
+
+GENERALIZE_FEW_SHOT = """
+Exempel:
+Text (sammanhang): "Patienten är en 67-årig snickare bosatt i Lilla Edet med Huntingtons sjukdom. Maken är barnneurolog vid Sahlgrenska."
+Utdrag att generalisera:
+1. "67-årig" (demographics)
+2. "snickare" (demographics)
+3. "Lilla Edet" (private_address)
+4. "Huntingtons sjukdom" (medical)
+5. "barnneurolog vid Sahlgrenska" (social)
+Generaliseringar:
+[
+  {"index": 1, "generalize": "60-70 år"},
+  {"index": 2, "generalize": "hantverkare"},
+  {"index": 3, "generalize": "mindre ort i Västra Götaland"},
+  {"index": 4, "generalize": "sällsynt neurologisk sjukdom"},
+  {"index": 5, "generalize": "specialistläkare vid större sjukhus"}
 ]
 """
 
@@ -573,12 +627,15 @@ class LLMBackend(ABC):
         enable_thinking: bool = False,
         scan_text: str | None = None,
         target_quotes: list[str] | None = None,
+        omit_generalize: bool = False,
     ) -> list[Entity]:
         """
         text:                    original document — always used to resolve entity offsets
         detect_direct=False:     quasi-identifiers only (used alongside BERT/rules)
         detect_direct=True:      all PII including direct identifiers (llm_only mode,
                                   or backstopping a prior pass — see scan_text)
+        omit_generalize=True:    detection-only (text/label/risk, no generalization) —
+                                  when a separate GeneralizeAgent handles it instead
         enable_thinking=True:    ask the model to reason in a <think> block before
                                   answering (only meaningful on backends that support
                                   it, e.g. Qwen3 — ignored by everything else)
@@ -599,6 +656,17 @@ class LLMBackend(ABC):
         task from detect(): pass/fail on the final text, not enumeration.
         Returns a list of {"quote": ..., "reason": ...} dicts; empty means
         the judge considers the document clean.
+        """
+        pass
+
+    @abstractmethod
+    def generalize(self, text: str, spans: list[tuple[str, str]], enable_thinking: bool = False) -> list:
+        """
+        Propose a generalization for each already-detected quasi-identifier
+        span — a separate task from detect() (the spans are given, not found).
+        spans is a list of (span_text, label). Returns a list aligned to spans
+        (same order); each element is the proposed generalization string, or
+        None where the model gave nothing usable. See generalize_agent.py.
         """
         pass
 
@@ -700,6 +768,7 @@ class HuggingFaceLLMBackend(LLMBackend):
         detect_direct: bool,
         enable_thinking: bool = False,
         target_quotes: list[str] | None = None,
+        omit_generalize: bool = False,
     ) -> str:
         if target_quotes:
             # Judge retry: don't re-run a blind full sweep and hope sampling
@@ -724,9 +793,13 @@ class HuggingFaceLLMBackend(LLMBackend):
             # to duplicate. Models weren't reliably following that instruction
             # anyway; removing the need for it is more robust than asking nicer.
             system = FULL_DETECTION_SYSTEM
+            few = FEW_SHOT_FULL_NOGEN if omit_generalize else FEW_SHOT_FULL
+            task = "Identifiera ALLA direkta identifierare och quasi-identifierare."
+            if omit_generalize:
+                task += _OMIT_GENERALIZE_INSTRUCTION
             user_msg = (
-                f"{FEW_SHOT_FULL}\n"
-                f"Identifiera ALLA direkta identifierare och quasi-identifierare.\n\n"
+                f"{few}\n"
+                f"{task}\n\n"
                 f"Text: \"{text}\"\n"
                 f"Entiteter:"
             )
@@ -734,10 +807,14 @@ class HuggingFaceLLMBackend(LLMBackend):
             # Hybrid mode — only quasi-identifiers, rules/BERT already ran
             already_found = ", ".join(set(e.label for e in existing)) or "inga ännu"
             system = QUASI_ID_SYSTEM
+            few = FEW_SHOT_NOGEN if omit_generalize else FEW_SHOT
+            task = "Identifiera ENBART quasi-identifierare som inte redan täcks."
+            if omit_generalize:
+                task += _OMIT_GENERALIZE_INSTRUCTION
             user_msg = (
-                f"{FEW_SHOT}\n"
+                f"{few}\n"
                 f"Redan identifierade entiteter: {already_found}\n"
-                f"Identifiera ENBART quasi-identifierare som inte redan täcks.\n\n"
+                f"{task}\n\n"
                 f"Text: \"{text}\"\n"
                 f"Quasi-identifierare:"
             )
@@ -785,9 +862,13 @@ class HuggingFaceLLMBackend(LLMBackend):
         enable_thinking: bool = False,
         scan_text: str | None = None,
         target_quotes: list[str] | None = None,
+        omit_generalize: bool = False,
     ) -> list[Entity]:
         """
         text: original document — always used to resolve entity offsets.
+        omit_generalize: run detection-only (return text/label/risk, no
+                   `generalize`) — used when a separate GeneralizeAgent will
+                   propose generalizations instead. See generalize_agent.py.
         scan_text: what's actually shown to the model (defaults to `text`).
                    Pass a partially-redacted version to backstop a prior
                    pass — anything already redacted is invisible to the
@@ -825,6 +906,7 @@ class HuggingFaceLLMBackend(LLMBackend):
                 entities.extend(self._detect_once(
                     text, scanned_text[start:end], existing, detect_direct,
                     enable_thinking, target_quotes=None, claimed_spans=claimed_spans,
+                    omit_generalize=omit_generalize,
                 ))
             # Chunks are non-overlapping by construction, so this doesn't
             # dedupe chunk-vs-chunk — it catches an entity that also got
@@ -835,7 +917,7 @@ class HuggingFaceLLMBackend(LLMBackend):
 
         return self._detect_once(
             text, scanned_text, existing, detect_direct, enable_thinking,
-            target_quotes, claimed_spans=set(),
+            target_quotes, claimed_spans=set(), omit_generalize=omit_generalize,
         )
 
     def _detect_once(
@@ -847,6 +929,7 @@ class HuggingFaceLLMBackend(LLMBackend):
         enable_thinking: bool,
         target_quotes: list[str] | None,
         claimed_spans: set[tuple[int, int]],
+        omit_generalize: bool = False,
     ) -> list[Entity]:
         """
         A single model call over `scanned_text` — the whole document when
@@ -865,6 +948,7 @@ class HuggingFaceLLMBackend(LLMBackend):
         prompt = self._build_prompt(
             scanned_text,
             existing, detect_direct, enable_thinking, target_quotes,
+            omit_generalize=omit_generalize,
         )
 
         input_tokens = None  # computed lazily below, only when actually needed
@@ -989,6 +1073,49 @@ class HuggingFaceLLMBackend(LLMBackend):
                 })
         return _parse_llm_json(generated)
 
+    def generalize(self, text: str, spans: list[tuple[str, str]], enable_thinking: bool = False) -> list:
+        if not spans:
+            return []
+        listing = "\n".join(f'{i + 1}. "{t}" ({label})' for i, (t, label) in enumerate(spans))
+        user_msg = (
+            f"{GENERALIZE_FEW_SHOT}\n"
+            f"Text (sammanhang):\n\"{text}\"\n\n"
+            f"Utdrag att generalisera:\n{listing}\n\n"
+            f"Generaliseringar:"
+        )
+        prompt = self._apply_chat_template(GENERALIZE_SYSTEM, user_msg, enable_thinking)
+
+        input_tokens = len(self.tokenizer.encode(text))
+        # One short JSON object per span, plus the same reasoning headroom
+        # detect()/judge() budget (some backends reason unconditionally).
+        max_new_tokens = max(512, 80 * len(spans)) + max(4096, input_tokens * 2)
+        generated = self._generate(prompt, max_new_tokens)
+        if enable_thinking:
+            reasoning = _extract_thinking(generated)
+            if reasoning:
+                self.reasoning_log.append({
+                    "stage": "generalize",
+                    "backend": self.backend_name,
+                    "scanned_text": text,
+                    "reasoning": reasoning,
+                })
+
+        raw = _parse_llm_json(generated)
+        result: list = [None] * len(spans)
+        for obj in raw:
+            if not isinstance(obj, dict):
+                continue
+            idx, gen = obj.get("index"), obj.get("generalize")
+            if isinstance(idx, int) and 1 <= idx <= len(spans) and isinstance(gen, str) and gen.strip():
+                result[idx - 1] = gen.strip()
+        # Fallback for a model that returned the right count but omitted indices.
+        if all(r is None for r in result) and len(raw) == len(spans):
+            for i, obj in enumerate(raw):
+                gen = obj.get("generalize") if isinstance(obj, dict) else None
+                if isinstance(gen, str) and gen.strip():
+                    result[i] = gen.strip()
+        return result
+
     def _generate(self, prompt: str, max_new_tokens: int, stream: bool = False) -> str:
         """
         Run generation via an explicit GenerationConfig — passing loose
@@ -1076,6 +1203,7 @@ class MockLLMBackend(LLMBackend):
         enable_thinking: bool = False,
         scan_text: str | None = None,
         target_quotes: list[str] | None = None,
+        omit_generalize: bool = False,
     ) -> list[Entity]:
         entities = []
         # Simple keyword scan to simulate LLM detection
@@ -1103,6 +1231,10 @@ class MockLLMBackend(LLMBackend):
     def judge(self, redacted_text: str, enable_thinking: bool = False) -> list[dict]:
         """Always reports clean — no model to actually audit with."""
         return []
+
+    def generalize(self, text: str, spans: list[tuple[str, str]], enable_thinking: bool = False) -> list:
+        """Canned per-label generalization so the stage's wiring is visible without a real model."""
+        return [f"generaliserad {label}" for _, label in spans]
 
 
 # ---------------------------------------------------------------------------

@@ -231,6 +231,12 @@ def main():
         help="Never trust the LLM's suggested generalization for a quasi-identifier — always use its category placeholder instead (default: off)"
     )
     parser.add_argument(
+        "--generalize-backend",
+        default=None,
+        choices=list(LLM_BACKENDS.keys()),
+        help="Run generalization as a SEPARATE stage with this backend (after detection, before the Label Studio export) instead of coupled into the detection LLM. Pass the same name as --llm to reuse that loaded model. Default: off (generalizations come from the detection LLM inline)."
+    )
+    parser.add_argument(
         "--label-studio-output",
         default=None,
         help="Write this document's detections as a Label Studio pre-annotation task to this path (overwriting it), plus (re)write a labeling_config.xml alongside it (default: off)"
@@ -252,6 +258,11 @@ def main():
         print(f"Gazetteer file not found at '{gazetteer_path}' — running without it. Pass --gazetteer to point at a real path, or --no-gazetteer to silence this.")
         gazetteer_path = None
 
+    generalize_config = (
+        {"name": args.generalize_backend, **LLM_BACKENDS[args.generalize_backend]}
+        if args.generalize_backend else None
+    )
+
     config = {
         **BASE_CONFIG,
         "llm_configs": [LLM_BACKENDS[name] for name in args.llm],
@@ -263,12 +274,13 @@ def main():
         "gazetteer_path": gazetteer_path,
         "quasi_only": args.quasi_only,
         "no_generalize": args.no_generalize,
+        "generalize_config": generalize_config,
     }
     print(
         f"Mode: {args.mode} | LLM: {'+'.join(args.llm)} | Backstop: {args.llm_backstop} | "
         f"Thinking: {args.llm_thinking} | Judges: {args.judges or 'none'} | "
         f"Gazetteer: {gazetteer_path or 'off'} | Quasi-only: {args.quasi_only} | "
-        f"No-generalize: {args.no_generalize}"
+        f"No-generalize: {args.no_generalize} | Generalize-backend: {args.generalize_backend or 'inline (coupled)'}"
     )
 
     pipe = PIIPipeline(config)

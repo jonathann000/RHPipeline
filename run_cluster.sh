@@ -37,6 +37,7 @@ JUDGE_MAX_ROUNDS=""
 LLM_BACKSTOP=""
 LLM_THINKING=""
 QUASI_ONLY=""
+GENERALIZE_BACKEND=""
 LABEL_STUDIO_OUTPUT=""
 LABEL_STUDIO_APPEND=""
 
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --llm-backstop)       LLM_BACKSTOP="--llm-backstop"; shift ;;
         --llm-thinking)       LLM_THINKING="--llm-thinking"; shift ;;
         --quasi-only)         QUASI_ONLY="--quasi-only"; shift ;;
+        --generalize-backend) GENERALIZE_BACKEND="$2"; shift 2 ;;
         --label-studio-output) LABEL_STUDIO_OUTPUT="$2"; shift 2 ;;
         --label-studio-append) LABEL_STUDIO_APPEND="--label-studio-append"; shift ;;
         --judges)
@@ -97,6 +99,7 @@ ARGS=(
 [[ -n "$LLM_BACKSTOP" ]] && ARGS+=("$LLM_BACKSTOP")
 [[ -n "$LLM_THINKING" ]] && ARGS+=("$LLM_THINKING")
 [[ -n "$QUASI_ONLY" ]] && ARGS+=("$QUASI_ONLY")
+[[ -n "$GENERALIZE_BACKEND" ]] && ARGS+=(--generalize-backend "$GENERALIZE_BACKEND")
 [[ -n "$LABEL_STUDIO_OUTPUT" ]] && ARGS+=(--label-studio-output "$LABEL_STUDIO_OUTPUT")
 [[ -n "$LABEL_STUDIO_APPEND" ]] && ARGS+=("$LABEL_STUDIO_APPEND")
 

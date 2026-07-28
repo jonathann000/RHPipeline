@@ -96,6 +96,7 @@ from gazetteer_agent import GazetteerAgent
 from llm_backend import load_llm, LLMBackend
 from rule_agent import RuleAgent
 from coreference import propagate_entities
+from generalize_agent import GeneralizeAgent
 from judge import Judge, JudgePanel
 from redaction import redact_document, resolve_replacement
 
@@ -139,6 +140,19 @@ class PIIPipeline:
             for c in config["llm_configs"]
         ]
 
+        # Optional separate generalization stage (see generalize_agent.py). Off
+        # by default -> generalizations stay coupled into the detection LLM's
+        # own output. When set, a dedicated agent (re)proposes them after
+        # detection, so they're populated before the Label Studio export. A
+        # backend already loaded as the main --llm is reused via load_llm()'s
+        # cache rather than loaded twice.
+        gen_config = config.get("generalize_config")
+        self.generalize_agent = GeneralizeAgent(
+            backend=load_llm(gen_config["llm_backend"], gen_config["llm_model_path"], gen_config.get("approx_params_b", 9)),
+            name=gen_config.get("name"),
+            enable_thinking=gen_config.get("enable_thinking", self.llm_thinking),
+        ) if gen_config else None
+
         judge_configs = config.get("judges", [])
         self.judge_panel = JudgePanel(judges=[
             Judge(
@@ -164,6 +178,8 @@ class PIIPipeline:
         if self.judge_panel:
             for judge in self.judge_panel.judges:
                 judge.backend.reasoning_log.clear()
+        if self.generalize_agent and self.generalize_agent.backend not in self.llms:
+            self.generalize_agent.backend.reasoning_log.clear()
 
         # --- Stage 1: Rule-based (skipped in llm_only mode) ---
         if self.rule_agent:
@@ -205,9 +221,23 @@ class PIIPipeline:
                 detect_direct=(not self.quasi_only) and ((self.mode in ("llm_only", "no_bert")) or self.llm_backstop),
                 enable_thinking=self.llm_thinking,
                 scan_text=scan_text,
+                # When a separate generalize agent runs (Stage 3.5), detection
+                # does one job — find text/label/risk — and skips generalization
+                # rather than producing suggestions the agent would overwrite.
+                omit_generalize=bool(self.generalize_agent),
             )
             all_entities.extend(llm_entities)
             logger.info(f"LLM agent ({llm.backend_name}) found {len(llm_entities)} entities")
+
+        # --- Stage 3.5: Separate generalization (optional) ---
+        # When a generalize agent is configured, it (re)proposes the
+        # generalization for every quasi-identifier found above, replacing the
+        # detection LLM's inline suggestion. Runs here — after detection, before
+        # coreference — so propagated mentions inherit the generalization and so
+        # every quasi span carries its proposal before the Label Studio export.
+        if self.generalize_agent:
+            n = self.generalize_agent.apply(text, all_entities)
+            logger.info(f"Generalize agent ({self.generalize_agent.name}) proposed {n} generalization(s)")
 
         # --- Stage 4: Gazetteer (skipped in llm_only mode, off unless configured) ---
         # Runs last among detection stages, purely as a gap-filler: it has
@@ -282,6 +312,8 @@ class PIIPipeline:
             for judge in self.judge_panel.judges:
                 if judge.backend not in self.llms:
                     reasoning_log.extend(judge.backend.reasoning_log)
+        if self.generalize_agent and self.generalize_agent.backend not in self.llms:
+            reasoning_log.extend(self.generalize_agent.backend.reasoning_log)
 
         return PipelineResult(
             original_text=text,
