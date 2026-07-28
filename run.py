@@ -112,6 +112,11 @@ LLM_BACKENDS = {
         "llm_model_path":  "meta-llama/Meta-Llama-3.1-8B-Instruct",
         "approx_params_b": 8,
     },
+    "llama_AIsweden": {
+        "llm_backend":     "llama",
+        "llm_model_path":  "AI-Sweden-Models/Llama-3-8B-instruct",
+        "approx_params_b": 8,
+    },
     "mistral": {
         "llm_backend":     "mistral",
         "llm_model_path":  "mistralai/Mistral-7B-Instruct-v0.3",
