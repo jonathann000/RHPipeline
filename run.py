@@ -142,7 +142,11 @@ LLM_BACKENDS = {
         "llm_model_path":  "Qwen/Qwen3.6-27B",
         "approx_params_b": 27,
     },
-
+    "qwen3.6-27b-finetuned": {
+        "llm_backend":     "qwen",
+        "llm_model_path":  "jtamondo/chonky",
+        "approx_params_b": 27,
+    },
     "gemma": {
         "llm_backend":     "gemma",
         "llm_model_path":  "google/gemma-2-9b-it",
