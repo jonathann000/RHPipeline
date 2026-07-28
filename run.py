@@ -117,13 +117,13 @@ LLM_BACKENDS = {
         "llm_model_path":  "mistralai/Mistral-7B-Instruct-v0.3",
         "approx_params_b": 7,
     },
-    "mistral3.2-24b": {
+    "mistral-small-24b": {
         "llm_backend":     "mistral",
-        "llm_model_path":  "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "llm_model_path":  "mistralai/Mistral-Small-24B-Instruct-2501",
         "approx_params_b": 24,
     },
     "ministral3-14b": {
-        "llm_backend":     "ministral",
+        "llm_backend":     "mistral",
         "llm_model_path":  "mistralai/Ministral-3-14B-Instruct-2512",
         "approx_params_b": 14,
     },
