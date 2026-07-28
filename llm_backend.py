@@ -1153,7 +1153,27 @@ class HuggingFaceLLMBackend(LLMBackend):
         # self.model.generation_config.eos_token_id (loaded from the
         # checkpoint's own generation_config.json) restores whatever
         # stop-token(s) that specific model actually defines.
-        eos_token_id = self.model.generation_config.eos_token_id or self.tokenizer.eos_token_id
+        eos_ids: set[int] = set()
+        gc_eos = self.model.generation_config.eos_token_id
+        if gc_eos is not None:
+            eos_ids.update([gc_eos] if isinstance(gc_eos, int) else gc_eos)
+        if self.tokenizer.eos_token_id is not None:
+            eos_ids.add(self.tokenizer.eos_token_id)
+        # Some Llama-3 chat checkpoints save generation_config.eos_token_id as
+        # only the base <|end_of_text|> (128001) while their chat template ends
+        # every assistant turn with <|eot_id|> (128009) — observed directly on
+        # AI-Sweden-Models/Llama-3-8B-instruct (gen eos 128001, template uses
+        # <|eot_id|>). Without <|eot_id|> in the stop set the model emits it,
+        # nothing halts on it, and generation runs to max_new_tokens (~5k
+        # tokens/chunk of unparseable output). Add it when — and only when — the
+        # tokenizer genuinely has that token (the id must round-trip back to the
+        # exact string), so this is a no-op for models that don't (Gemma/Qwen/
+        # Mistral keep exactly the stop-token(s) their own config defines).
+        # Meta's own Llama-3.1 already lists 128009, so its stop set is unchanged.
+        eot = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if isinstance(eot, int) and eot >= 0 and self.tokenizer.convert_ids_to_tokens(eot) == "<|eot_id|>":
+            eos_ids.add(eot)
+        eos_token_id = sorted(eos_ids) if eos_ids else None
 
         gen_config = GenerationConfig(
             max_new_tokens=max_new_tokens,
