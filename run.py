@@ -122,10 +122,10 @@ LLM_BACKENDS = {
         "llm_model_path":  "mistralai/Mistral-Small-24B-Instruct-2501",
         "approx_params_b": 24,
     },
-    "ministral3-14b": {
+    "ministral8b": {
         "llm_backend":     "mistral",
-        "llm_model_path":  "mistralai/Ministral-3-14B-Instruct-2512",
-        "approx_params_b": 14,
+        "llm_model_path":  "mistralai/Ministral-8B-Instruct-2410",
+        "approx_params_b": 8,
     },
     "qwen": {
         "llm_backend":     "qwen",
@@ -135,7 +135,7 @@ LLM_BACKENDS = {
     "qwen-32b": {
         "llm_backend":     "qwen",
         "llm_model_path":  "Qwen/Qwen3-32B",
-        "approx_params_b": 32,  # needs 8-bit on a 40GB card — auto-detected, see device.py
+        "approx_params_b": 32,  
     },
     "qwen3.6-27b": {
         "llm_backend":     "qwen",
@@ -151,17 +151,17 @@ LLM_BACKENDS = {
     "gemma-27b": {
         "llm_backend":     "gemma",
         "llm_model_path":  "google/gemma-2-27b-it",
-        "approx_params_b": 27,  # needs 4-bit on a 40GB card — auto-detected, see device.py
+        "approx_params_b": 27, 
     },
     "gemma4-12b": {
         "llm_backend":     "gemma",
         "llm_model_path":  "google/gemma-4-12B-it",
-        "approx_params_b": 12,  # fits full bf16 on a 40GB card (~29GB w/ safety margin) — auto-detected, see device.py
+        "approx_params_b": 12,  
     },
     "gemma4-31b": {
         "llm_backend":     "gemma",
         "llm_model_path":  "google/gemma-4-31B-it",
-        "approx_params_b": 31,  # needs 4-bit on a 40GB card — auto-detected, see device.py
+        "approx_params_b": 31, 
     },
 }
 
