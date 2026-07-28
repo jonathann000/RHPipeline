@@ -117,6 +117,16 @@ LLM_BACKENDS = {
         "llm_model_path":  "mistralai/Mistral-7B-Instruct-v0.3",
         "approx_params_b": 7,
     },
+    "mistral3.2-24b": {
+        "llm_backend":     "mistral",
+        "llm_model_path":  "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "approx_params_b": 24,
+    },
+    "ministral3-14b": {
+        "llm_backend":     "ministral",
+        "llm_model_path":  "mistralai/Ministral-3-14B-Instruct-2512",
+        "approx_params_b": 14,
+    },
     "qwen": {
         "llm_backend":     "qwen",
         "llm_model_path":  "Qwen/Qwen3-8B",
@@ -128,9 +138,9 @@ LLM_BACKENDS = {
         "approx_params_b": 32,  # needs 8-bit on a 40GB card — auto-detected, see device.py
     },
     "qwen3.6-27b": {
-        "llm_backend":     "qwen",          # reuse the generic qwen path (chat template, thinking kwarg)
-        "llm_model_path":  "Qwen/Qwen3.6-27B",   # <-- VERIFY the exact HF repo id on the model card
-        "approx_params_b": 27,              # 4-bit on a 40GB card, bf16 on 80GB — auto-detected (device.py)
+        "llm_backend":     "qwen",
+        "llm_model_path":  "Qwen/Qwen3.6-27B",
+        "approx_params_b": 27,
     },
 
     "gemma": {
