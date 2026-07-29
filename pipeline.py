@@ -214,10 +214,20 @@ class PIIPipeline:
             redact_document(text, build_redaction_plan(text, all_entities), self.no_generalize)
             if self.llm_backstop else None
         )
+        # Snapshot the entities found before ANY LLM ran (rules/BERT only) and
+        # give every backend that same fixed context — so in an ensemble each
+        # LLM detects INDEPENDENTLY, exactly as it would on its own. Passing the
+        # growing all_entities instead would show each later backend the earlier
+        # ones' findings, and the quasi prompt's "identify only quasi not already
+        # covered" instruction would then suppress precisely the complementary
+        # detections that make an ensemble worthwhile (measured: a qwen+llama
+        # ensemble collapsed to ~single-model recall). No effect on a single-LLM
+        # run — the snapshot equals all_entities at that point.
+        pre_llm_entities = list(all_entities)
         for llm in self.llms:
             llm_entities = llm.detect(
                 text,
-                existing=all_entities,
+                existing=pre_llm_entities,
                 detect_direct=(not self.quasi_only) and ((self.mode in ("llm_only", "no_bert")) or self.llm_backstop),
                 enable_thinking=self.llm_thinking,
                 scan_text=scan_text,
