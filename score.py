@@ -144,6 +144,46 @@ def aggregate_of(results: list) -> dict:
     return agg
 
 
+def ensemble_note(key_entry: dict, runs: list) -> dict:
+    """
+    Score the UNION of several runs on one note, i.e. what a real `--llm A B`
+    ensemble would achieve (findings merged, then redacted once):
+      - a should-redact item counts as caught if it was removed in ANY run;
+      - a decoy counts as kept only if it survived in EVERY run (any run that
+        over-redacts it loses it in the merged output);
+      - a medication is ok if flagged in ANY run AND kept in EVERY run.
+    `runs` is a list of (redacted_text, audit_list). Returns the same shape as
+    score_note so aggregate_of / the table printer work unchanged.
+    """
+    reds = [norm(r) for r, _ in runs]
+    med_audits = [[e.get("original", "") for e in a if e.get("label") == "medication"] for _, a in runs]
+
+    buckets = {"direct": {"total": 0, "removed": 0, "misses": []},
+               "quasi":  {"total": 0, "removed": 0, "misses": []}}
+    for item in key_entry.get("should_redact", []):
+        b = buckets[item["type"]]
+        b["total"] += 1
+        if any(not present(item["text"], rn) for rn in reds):   # removed in at least one run
+            b["removed"] += 1
+        else:
+            b["misses"].append(item)
+
+    decoys = key_entry.get("should_not_flag", [])
+    over = [d for d in decoys if not all(present(d, rn) for rn in reds)]
+    meds = key_entry.get("medications_flag_keep", [])
+    med_ok = sum(
+        1 for m in meds
+        if any(any(overlaps(m, o) for o in ma) for ma in med_audits)  # flagged by some run
+        and all(present(m, rn) for rn in reds)                        # kept by every run
+    )
+    return {
+        "direct": buckets["direct"],
+        "quasi": buckets["quasi"],
+        "decoys": {"total": len(decoys), "preserved": len(decoys) - len(over), "over_redacted": over},
+        "meds": {"total": len(meds), "ok": med_ok, "missing_flag": [], "wrongly_redacted": []},
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="Score a pipeline run against the synthetic gold key.")
     ap.add_argument("--key", default="data/synthetic_notes_key.json")
@@ -154,6 +194,9 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="List every miss / over-redaction")
     ap.add_argument("--compare", nargs="+", metavar="RUNS_DIR",
                     help="Compare several run directories side by side (label = each dir's basename)")
+    ap.add_argument("--ensemble", nargs="+", metavar="RUNS_DIR",
+                    help="Score the UNION of several runs (what an `--llm A B` ensemble would achieve) "
+                         "alongside each component run — recall gain vs precision cost, computed offline")
     args = ap.parse_args()
 
     key = json.load(open(args.key, encoding="utf-8"))
@@ -181,6 +224,56 @@ def main():
                   f"{pct(*a['decoys'])} "
                   f"{pct(*a['meds'])}")
         print(legend)
+        return
+
+    # --- Ensemble (union) mode ----------------------------------------------
+    if args.ensemble:
+        header = f"{'model / run':22} {'direct-recall':>13} {'quasi-recall':>13} {'decoy-keep':>11} {'med-ok':>8}"
+        print(header)
+        print("-" * len(header))
+
+        def row(label, a):
+            print(f"{label:22} "
+                  f"{pct(*a['direct'])} ({a['direct'][0]:2}/{a['direct'][1]:<2}) "
+                  f"{pct(*a['quasi'])} ({a['quasi'][0]:2}/{a['quasi'][1]:<2}) "
+                  f"{pct(*a['decoys'])} "
+                  f"{pct(*a['meds'])}")
+
+        # Load each run's per-note outputs; show each component's own totals.
+        dir_notes: dict[str, dict] = {}
+        for runs_dir in args.ensemble:
+            outputs = {}
+            for n in note_names:
+                stem = n[:-4] if n.endswith(".txt") else n
+                red = os.path.join(runs_dir, f"{stem}.redacted.txt")
+                aud = os.path.join(runs_dir, f"{stem}.audit.json")
+                if os.path.exists(red) and os.path.exists(aud):
+                    outputs[n] = (open(red, encoding="utf-8").read(), json.load(open(aud, encoding="utf-8")))
+            dir_notes[runs_dir] = outputs
+            label = os.path.basename(os.path.normpath(runs_dir)) or runs_dir
+            comp = [(n, score_note(key[n], a, r)) for n, (r, a) in outputs.items()]
+            if comp:
+                row(label, aggregate_of(comp))
+
+        # Union: only notes present in every run can be ensembled.
+        common = [n for n in note_names if all(n in dir_notes[d] for d in args.ensemble)]
+        ens = [(n, ensemble_note(key[n], [dir_notes[d][n] for d in args.ensemble])) for n in common]
+        print("-" * len(header))
+        if ens:
+            row("ENSEMBLE (union)", aggregate_of(ens))
+        else:
+            print("ENSEMBLE (union)     (no notes present in all given runs)")
+        print(legend)
+        print("\nUnion = an item is caught if removed by ANY run (recall ceiling); a decoy is "
+              "kept only if left intact by EVERY run (so precision can only drop). This predicts "
+              "a real `--llm A B ...` ensemble; run one to confirm exactly.")
+        if args.verbose and ens:
+            for note, r in ens:
+                misses = [f"    still MISSED by all [{k}/{m['label']}] {m['text']!r}"
+                          for k in ("direct", "quasi") for m in r[k]["misses"]]
+                if misses:
+                    print(f"\n{note}:")
+                    print("\n".join(misses))
         return
 
     # --- Single-note mode ----------------------------------------------------
