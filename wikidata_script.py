@@ -5,7 +5,7 @@ import requests
 # Define Wikidata endpoint and a descriptive User-Agent (required by Wikidata)
 WIKIDATA_URL = "https://query.wikidata.org/sparql"
 HEADERS = {
-    "User-Agent": "SwedishMedicalDeidBot/1.0 (contact: your-email@domain.com) Python/requests"
+    "User-Agent": "SwedishMedicalDeidBot/1.0 (+https://github.com/jonathann000/RHPipeline) Python/requests"
 }
 
 # Places: filtered by "located in Sweden" (P17) — straightforward, since a
@@ -21,10 +21,9 @@ PLACE_FILTER = "?entity wdt:P17 wd:Q34 ."
 # Names: a name isn't "located in" a country, so filtering by P17 doesn't
 # apply. Also, "has a Swedish-language label" turned out NOT to be a useful
 # proxy — Wikidata auto-fills sv labels on names regardless of actual usage
-# (tested empirically: returned entries like "Nebahat", "Femmina", clearly
-# not Swedish). What actually works: P407 "language of work or name" = Q9027
+# What actually works: P407 "language of work or name" = Q9027
 # (Swedish) — tags the name itself as linguistically Swedish, verified to
-# return genuinely Nordic names (Börje, Karolina, Anders Gustaf, ...).
+# return genuinely Nordic names (Börje, Karolina, Anders, Gustaf, ...).
 NAME_CATEGORIES = {
     "Q202444": "Given_Name",
     "Q101352": "Family_Name",

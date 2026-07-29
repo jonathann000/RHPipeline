@@ -197,6 +197,9 @@ def main():
     ap.add_argument("--ensemble", nargs="+", metavar="RUNS_DIR",
                     help="Score the UNION of several runs (what an `--llm A B` ensemble would achieve) "
                          "alongside each component run — recall gain vs precision cost, computed offline")
+    ap.add_argument("--aggregate", nargs="+", metavar="RUNS_DIR",
+                    help="Group seed runs by model (strips a trailing _sN / _seedN) and report "
+                         "mean and min-max per metric across seeds")
     args = ap.parse_args()
 
     key = json.load(open(args.key, encoding="utf-8"))
@@ -205,6 +208,37 @@ def main():
     legend = ("\nLegend: direct/quasi-recall = fraction of expected identifiers actually "
               "removed from the output. decoy-keep = fraction of decoys left intact "
               "(precision proxy). med-ok = medications both flagged in the audit AND kept verbatim.")
+
+    # --- Aggregate mode: group seed runs by model, report mean + min-max ----
+    if args.aggregate:
+        import re as _re
+        groups: dict[str, list] = {}
+        for runs_dir in args.aggregate:
+            results = score_dir(key, note_names, runs_dir, warn=False)
+            if not results:
+                continue
+            a = aggregate_of(results)
+            rates = {k: (100 * a[k][0] / a[k][1] if a[k][1] else 0.0)
+                     for k in ("direct", "quasi", "decoys", "meds")}
+            label = _re.sub(r"_s(eed)?\d+$", "", os.path.basename(os.path.normpath(runs_dir)))
+            groups.setdefault(label, []).append(rates)
+
+        header = f"{'model':24} {'n':>2}  {'direct-recall':>22} {'quasi-recall':>22} {'decoy-keep':>22} {'med-ok':>22}"
+        print(header)
+        print("-" * len(header))
+
+        def cell(vals):
+            mean = sum(vals) / len(vals)
+            return f"{mean:5.1f}% ({min(vals):.1f}-{max(vals):.1f})" if len(vals) > 1 else f"{mean:5.1f}%"
+
+        for label, rs in groups.items():
+            print(f"{label:24} {len(rs):>2}  "
+                  f"{cell([r['direct'] for r in rs]):>22} "
+                  f"{cell([r['quasi'] for r in rs]):>22} "
+                  f"{cell([r['decoys'] for r in rs]):>22} "
+                  f"{cell([r['meds'] for r in rs]):>22}")
+        print("\nEach cell: mean% (min-max across seeds). " + legend.strip())
+        return
 
     # --- Comparison mode: one aggregate row per run directory ---------------
     if args.compare:
