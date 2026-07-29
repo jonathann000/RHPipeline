@@ -1181,17 +1181,24 @@ class HuggingFaceLLMBackend(LLMBackend):
             do_sample=True,
             eos_token_id=eos_token_id,
             pad_token_id=self.tokenizer.eos_token_id,
-            # Hard block on repeating an exact 24-token run — guards against
-            # the model falling into a degenerate loop re-emitting the same
-            # JSON entity forever instead of finishing (measured: the fixed
-            # JSON scaffold shared between two DIFFERENT entities with the
-            # same label/risk is ~20 tokens, a real duplicated entity line
-            # is ~43 — 24 sits between the two, so two distinct entities
-            # that happen to share a label/risk/generalize combo can still
-            # both be emitted, but the same entity repeating verbatim gets
-            # cut off almost immediately instead of consuming the whole
-            # generation budget).
-            no_repeat_ngram_size=24,
+            # Guard against a degenerate loop re-emitting the same JSON forever
+            # — but sized NOT to corrupt legitimate repeated structure. At 24
+            # this backfired badly: a note with several medications produces
+            # many entities sharing an identical field scaffold
+            # ("label":"medication","risk":"low","generalize":null ...), whose
+            # repeated run exceeds 24 tokens, so no_repeat_ngram forced the model
+            # to perturb it — dropping the 'e' in "generaliz", adding a trailing
+            # space, escaping a quote, omitting a closing quote — producing
+            # invalid JSON whose entities were then silently dropped by the
+            # salvage parser (observed directly on qwen3.6 in med-heavy notes;
+            # it depressed recall and med-ok at random per run). Raised above a
+            # full entity line (~43 tokens): a repeated scaffold or even a
+            # duplicated entity is now left intact — a duplicate is harmless
+            # (de-duplicated downstream by remove_overlapping_entities), whereas
+            # a corrupted entity is lost — while a genuine multi-entity runaway
+            # loop (a >50-token block repeating) is still cut off, and
+            # max_new_tokens bounds generation regardless.
+            no_repeat_ngram_size=50,
         )
         output = self.pipe(
             prompt,
