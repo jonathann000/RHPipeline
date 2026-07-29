@@ -1,6 +1,7 @@
 # Model weights
 models/
 llms/
+saved_models/
 
 # Cache
 .model_cache/

@@ -5,6 +5,7 @@ Processes spans in reverse order to preserve character offsets.
 """
 
 import logging
+import re
 
 from entities import Entity, ALWAYS_DIRECT_LABELS, NEVER_REDACT_LABELS
 
@@ -33,7 +34,35 @@ PLACEHOLDERS = {
     "private_biometric":  "[BIOMETRISK-UPPGIFT]",
     "private_photo":      "[FOTOGRAFI]",
     "private_other":      "[ÖVRIG-UPPGIFT]",
+    # An age detected by BERT (see bert_agent.py's _BERT_LABEL_MAP "Age").
+    # Only used as a last-resort placeholder — resolve_replacement first tries
+    # a deterministic age-range generalization (see _generalize_age).
+    "age":                "[ÅLDER]",
 }
+
+
+def _generalize_age(text: str) -> str | None:
+    """
+    Deterministic age -> decade-range generalization, so a BERT-detected age
+    the LLM didn't already cover degrades to an informative "50-60 år" rather
+    than a blunt [ÅLDER] — no LLM round-trip needed. Because this is pure
+    arithmetic it can't be factually wrong the way an LLM paraphrase can.
+
+    Follows the range style the LLM few-shots already use ("50-60 år"), with
+    HIPAA Safe Harbor's rule that ages 90+ are aggregated (very old ages are
+    themselves identifying). Returns None when no plausible age number is
+    present, so the caller falls back to the [ÅLDER] placeholder.
+    """
+    match = re.search(r"\d{1,3}", text)
+    if not match:
+        return None
+    age = int(match.group())
+    if age >= 90:
+        return "90 år eller äldre"
+    if not 0 < age < 90:
+        return None  # implausible (0, or >120 from a stray match) — placeholder instead
+    low = (age // 10) * 10
+    return f"{low}-{low + 10} år"
 
 
 def resolve_replacement(entity: Entity, no_generalize: bool = False) -> str:
@@ -78,6 +107,14 @@ def resolve_replacement(entity: Entity, no_generalize: bool = False) -> str:
         and not _is_non_generalization(entity.text, entity.generalized)
     ):
         return entity.generalized
+    # Age with no trusted generalization (a BERT "Age" hit the LLM didn't
+    # already cover with a wider, generalized demographics span): fall back to
+    # a deterministic decade range rather than the blunt [ÅLDER] placeholder.
+    # Skipped under no_generalize, which asks for placeholders everywhere.
+    if entity.label == "age" and not no_generalize:
+        age_range = _generalize_age(entity.text)
+        if age_range:
+            return age_range
     return PLACEHOLDERS.get(entity.label, "[REDAKTERAD]")
 
 

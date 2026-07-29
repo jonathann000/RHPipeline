@@ -54,6 +54,15 @@ _BERT_LABEL_MAP = {
     "Bio": "private_biometric",
     "Face": "private_photo",
     "etc": "private_other",
+    # Some newer NER checkpoints (see saved_models/) emit an "Age" category.
+    # Mapped to its own "age" label rather than folded into "demographics",
+    # so it keeps a meaningful placeholder ([ÅLDER]) and gets a deterministic
+    # decade-range generalization when the LLM didn't already cover it — see
+    # redaction.py's PLACEHOLDERS / _generalize_age. Left OUT of
+    # ALWAYS_DIRECT_LABELS (age alone isn't a unique identifier), so a wider
+    # LLM demographics span still wins overlap resolution and supplies its
+    # own generalization where present.
+    "Age": "age",
 }
 
 
