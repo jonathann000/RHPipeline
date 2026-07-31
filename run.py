@@ -175,7 +175,7 @@ LLM_BACKENDS = {
 }
 
 BASE_CONFIG = {
-    "bert_model_path": os.environ.get("BERT_MODEL_PATH", "./models/MBERTHIPAA"),
+    "bert_model_path": os.environ.get("BERT_MODEL_PATH", "jtamondo/RH-BEHRT_Swedish_Hippa_BERT_BASE"),
 }
 
 # A committed repo asset (see wikidata_script.py), not something that needs
