@@ -211,11 +211,10 @@ to `data/out/` are ignored automatically — no per-file `.gitignore` edits need
 
 ## Models
 
-Place NER checkpoints under `models/` (git-ignored). This repo has been used with:
-
-- `models/MBERTHIPAA` — HIPAA Safe Harbor 18-category NER (current default)
-- `models/Roberta` — Swedish RoBERTa NER
-- `models/ModelOAI`
+Grab Bert models with the tag RH-BEHRT Bert from hugging or could be set to locally fine tuned later:
+- `jtamondo/RH-BEHRT_Swedish_Hippa_BERT_BASE` — Swedish Bert Base KB-LAb (default) best performer
+- `jtamondo/RH-BEHRT_KBLAB_Megatron` — Megatron Large
+- `jtamondo/RH-BEHRT_Modern_Bert`
 
 Select one via `BERT_MODEL_PATH` (defaults to `./models/MBERTHIPAA`). LLM
 checkpoints are downloaded from HuggingFace on first use and cached in
