@@ -59,7 +59,7 @@ end-to-end with a mock LLM and rules only:
 **2. A real run.** Point `BERT_MODEL_PATH` at your NER checkpoint, then:
 
 ```bash
-export BERT_MODEL_PATH=./models/MBERTHIPAA     # or ./models/Roberta
+export BERT_MODEL_PATH=jtamondo/RH-BEHRT_Swedish_Hippa_BERT_BASE    # or jtamondo/RH-BEHRT_KBLAB_Megatron
 bash run_cluster.sh --input data/notes.txt --llm mistral
 ```
 
