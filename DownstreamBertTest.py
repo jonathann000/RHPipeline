@@ -21,6 +21,7 @@ def parse_label_studio_export_chunked(json_path_or_data):
     """
     Parses a Label Studio JSON export and splits large documents into smaller chunks
     (by newline or sentence boundary), recalculating annotation offsets for each chunk.
+    Handles multiple Label Studio export formats safely.
     """
     if isinstance(json_path_or_data, str):
         with open(json_path_or_data, "r", encoding="utf-8") as f:
@@ -35,17 +36,28 @@ def parse_label_studio_export_chunked(json_path_or_data):
         full_text = entry.get("data", {}).get("text", "")
         full_spans = []
         
-        # Pull all annotations for the full page
-        if entry.get("predictions") and len(entry["predictions"]) > 0:
-            results = entry["predictions"][0].get("result", [])
-            for res in results:
-                val = res.get("value", {})
-                if "start" in val and "end" in val and "labels" in val:
-                    full_spans.append({
-                        "start": val["start"],
-                        "end": val["end"],
-                        "label": val["labels"][0]
-                    })
+        # Combine annotations and predictions into one list to check
+        lists_to_check = []
+        if isinstance(entry.get("annotations"), list):
+            lists_to_check.extend(entry["annotations"])
+        if isinstance(entry.get("predictions"), list):
+            lists_to_check.extend(entry["predictions"])
+            
+        # Find the first valid dictionary that contains our label results
+        for item in lists_to_check:
+            if isinstance(item, dict) and "result" in item:
+                results = item.get("result", [])
+                for res in results:
+                    val = res.get("value", {})
+                    if "start" in val and "end" in val and "labels" in val:
+                        full_spans.append({
+                            "start": val["start"],
+                            "end": val["end"],
+                            "label": val["labels"][0]
+                        })
+                # Break after finding the first valid set of labels for this document
+                if full_spans:
+                    break
         
         # --- CHUNKING LOGIC ---
         # Find boundaries to split on: newlines, or periods followed by a space
@@ -86,8 +98,13 @@ def parse_label_studio_export_chunked(json_path_or_data):
 def main():
     parser = argparse.ArgumentParser(description="Train a downstream BERT model for NER using Label Studio data.")
     parser.add_argument("json_file", type=str, help="Path to the Label Studio JSON export.")
-    parser.add_argument("model_id", type=str, help="Pre-trained model ID or local path (e.g., KBLab/bert-base-swedish-cased).")
     parser.add_argument("save_name", type=str, help="Name for the output directory to save the model.")
+    parser.add_argument(
+        "--model_id", 
+        type=str, 
+        default="jtamondo/RH-BEHRT_Swedish_Hippa_BERT_BASE", 
+        help="Pre-trained model ID or local path. (Default: jtamondo/RH-BEHRT_Swedish_Hippa_BERT_BASE)"
+    )
     args = parser.parse_args()
 
     # Initialize your dataset with the new chunked parser
