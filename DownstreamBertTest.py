@@ -137,6 +137,7 @@ def main():
     # Mapping Label Studio explicit raw labels to standard HIPAA targets
     category_mapping = {
         "private_person": "Name",
+        "Age": "age",
         "private_address": "Address",
         "private_date": "Dates",
         "private_phone": "Phone",
