@@ -1,8 +1,10 @@
 import json
 import numpy as np
 import torch
+import re
+import argparse
 from collections import Counter
-from datasets import Dataset, DatasetDict
+from datasets import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForTokenClassification,
@@ -10,13 +12,11 @@ from transformers import (
     TrainingArguments,
     DataCollatorForTokenClassification
 )
-from seqeval.metrics import f1_score, precision_score, recall_score, classification_report
+from seqeval.metrics import f1_score, precision_score, recall_score
 
 # =====================================================================
 # 1. Label Studio JSON Parser Bridge
 # =====================================================================
-import re
-
 def parse_label_studio_export_chunked(json_path_or_data):
     """
     Parses a Label Studio JSON export and splits large documents into smaller chunks
@@ -83,90 +83,77 @@ def parse_label_studio_export_chunked(json_path_or_data):
         "privacy_mask": privacy_masks
     })
 
-# Initialize your dataset with the new chunked parser
-raw_dataset = parse_label_studio_export_chunked("label_studio_gemma4.json")
+def main():
+    parser = argparse.ArgumentParser(description="Train a downstream BERT model for NER using Label Studio data.")
+    parser.add_argument("json_file", type=str, help="Path to the Label Studio JSON export.")
+    parser.add_argument("model_id", type=str, help="Pre-trained model ID or local path (e.g., KBLab/bert-base-swedish-cased).")
+    parser.add_argument("save_name", type=str, help="Name for the output directory to save the model.")
+    args = parser.parse_args()
 
-# For demonstration: split into train/val (In production, use actual separate exports or .train_test_split())
-split_ds = raw_dataset.train_test_split(test_size=0.5 if len(raw_dataset) == 1 else 0.2)
-train_dataset = split_ds["train"]
-val_dataset = split_ds["test"]
+    # Initialize your dataset with the new chunked parser
+    print(f"Loading data from {args.json_file}...")
+    raw_dataset = parse_label_studio_export_chunked(args.json_file)
 
-# =====================================================================
-# 2. Schema and Label Mapping
-# =====================================================================
-Hippa_categories = [
-    "Name",
-    "Address",
-    "Dates",
-    "Phone",
-    "Email",
-    "Account_Num",
-    "Vehicle",
-    "Device_Num",
-    "URL",
-    "IP",
-    "Bio",
-    "Face",
-    "Age",
-    "etc"
-]
+    # For demonstration: split into train/val
+    split_ds = raw_dataset.train_test_split(test_size=0.5 if len(raw_dataset) == 1 else 0.2)
+    train_dataset = split_ds["train"]
+    val_dataset = split_ds["test"]
 
-labels = ["O"] + [
-    f"{prefix}-{cat}"
-    for cat in Hippa_categories
-    for prefix in ["B", "I"]
-]
+    # =====================================================================
+    # 2. Schema and Label Mapping
+    # =====================================================================
+    Hippa_categories = [
+        "Name", "Address", "Dates", "Phone", "Email", "Account_Num",
+        "Vehicle", "Device_Num", "URL", "IP", "Bio", "Face", "Age", "etc"
+    ]
 
-openai_label2id = {label: i for i, label in enumerate(labels)}
-openai_id2label = {i: label for label, i in openai_label2id.items()}
-outside_id = openai_label2id["O"]
+    labels = ["O"] + [
+        f"{prefix}-{cat}"
+        for cat in Hippa_categories
+        for prefix in ["B", "I"]
+    ]
 
-# Mapping Label Studio explicit raw labels to standard HIPAA targets
-category_mapping = {
-    "private_person": "Name",
-    "private_address": "Address",
-    "private_date": "Dates",
-    "private_phone": "Phone",
-    "private_email": "Email",
-    "account_number": "Account_Num",
-    "private_vehicle": "Vehicle",
-    "private_device": "Device_Num",
-    "private_url": "URL",
-    "private_ip": "IP",
-    "private_biometric": "Bio",
-    "private_photo": "Face",
-    "private_other": "etc"
-}
+    openai_label2id = {label: i for i, label in enumerate(labels)}
+    openai_id2label = {i: label for label, i in openai_label2id.items()}
+    outside_id = openai_label2id["O"]
 
-# --- Sanity check ---
-seen = Counter()
-for row in train_dataset:
-    for span in row["privacy_mask"]:
-        seen[span["label"]] += 1
+    # Mapping Label Studio explicit raw labels to standard HIPAA targets
+    category_mapping = {
+        "private_person": "Name",
+        "private_address": "Address",
+        "private_date": "Dates",
+        "private_phone": "Phone",
+        "private_email": "Email",
+        "account_number": "Account_Num",
+        "private_vehicle": "Vehicle",
+        "private_device": "Device_Num",
+        "private_url": "URL",
+        "private_ip": "IP",
+        "private_biometric": "Bio",
+        "private_photo": "Face",
+        "private_other": "etc"
+    }
 
-mapped_keys   = set(category_mapping) & set(seen)
-unmapped_keys = set(seen) - set(category_mapping)
-print("Raw label counts:", dict(seen))
-print("Mapped (will train):", sorted(mapped_keys))
-print("Dropped -> 'O':", sorted(unmapped_keys))
+    # --- Sanity check ---
+    seen = Counter()
+    for row in train_dataset:
+        for span in row["privacy_mask"]:
+            seen[span["label"]] += 1
 
-# =====================================================================
-# 3. Model Iteration & Subword Alignment Training
-# =====================================================================
-#Change to local model can do multiple at onece or just one
-model_ids = [
-    "./models/saved_models/KBLab_bert-base-swedish-cased",
-]
+    mapped_keys = set(category_mapping) & set(seen)
+    unmapped_keys = set(seen) - set(category_mapping)
+    print("Raw label counts:", dict(seen))
+    print("Mapped (will train):", sorted(mapped_keys))
+    print("Dropped -> 'O':", sorted(unmapped_keys))
 
-all_results = {}
-detailed_reports = {}
-
-for model_id in model_ids:
+    # =====================================================================
+    # 3. Model Iteration & Subword Alignment Training
+    # =====================================================================
+    model_id = args.model_id
     print(f"\n{'='*50}\nTraining model: {model_id}\n{'='*50}")
     
-    safe_model_name = model_id.replace("/", "_")
-    output_dir = f"./checkpoints_{safe_model_name}"
-    save_dir = f"./saved_models/{safe_model_name}"
+    output_dir = f"./checkpoints_{args.save_name}"
+    save_dir = f"./saved_models/{args.save_name}"
 
     model = AutoModelForTokenClassification.from_pretrained(
         model_id,
@@ -287,5 +274,7 @@ for model_id in model_ids:
     print(f"Saving {model_id} to {save_dir}...")
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+    print("\nProcessing complete!")
 
-print("\nProcessing complete!")
+if __name__ == "__main__":
+    main()
