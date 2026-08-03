@@ -10,7 +10,8 @@ from transformers import (
     AutoModelForTokenClassification,
     Trainer,
     TrainingArguments,
-    DataCollatorForTokenClassification
+    DataCollatorForTokenClassification,
+    EarlyStoppingCallback # Added EarlyStoppingCallback
 )
 from seqeval.metrics import f1_score, precision_score, recall_score
 
@@ -137,7 +138,6 @@ def main():
     # Mapping Label Studio explicit raw labels to standard HIPAA targets
     category_mapping = {
         "private_person": "Name",
-        "age": "Age",
         "private_address": "Address",
         "private_date": "Dates",
         "private_phone": "Phone",
@@ -245,11 +245,13 @@ def main():
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=1,
-        num_train_epochs=1,
+        num_train_epochs=10,             # Increased to 10 so early stopping can actually trigger
         weight_decay=0.01,
         logging_steps=1,
         bf16=torch.cuda.is_available(), 
-        load_best_model_at_end=False
+        load_best_model_at_end=True,     # Changed to True
+        metric_for_best_model="f1",      # Uses the F1 score from compute_metrics to determine the best model
+        save_total_limit=2               # Keeps only the 2 most recent checkpoints to save disk space
     )
 
     def compute_metrics(pred):
@@ -284,12 +286,14 @@ def main():
         eval_dataset=tokenized_val,
         compute_metrics=compute_metrics,
         data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)] # Stops if F1 doesn't improve for 3 epochs
     )
 
     print(f"Starting training for {model_id}...")
     trainer.train()
 
-    print(f"Saving {model_id} to {save_dir}...")
+    # Because load_best_model_at_end=True, the model in memory is now the best one!
+    print(f"Saving the best {model_id} model to {save_dir}...")
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
     print("\nProcessing complete!")
